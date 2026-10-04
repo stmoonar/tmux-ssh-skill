@@ -34,7 +34,8 @@ def exec_one(args: argparse.Namespace, session: str, body: str | None) -> dict:
     tmux = Tmux(args.socket)
     row: dict = {"session": session, "status": "FAIL"}
     try:
-        with session_lock(args.socket, session, timeout=args.lock_timeout):
+        with session_lock(args.socket, session, timeout=args.lock_timeout,
+                          recover=args.recover_session):
             pane = tmux.active_pane(session)
             row["pane"] = pane
             if body is not None:
@@ -84,6 +85,8 @@ def main() -> int:
     parser.add_argument("--python", default="python3", help="remote interpreter for --python-file")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--lock-timeout", type=float, default=900.0)
+    parser.add_argument("--recover-session", action="store_true",
+                        help="acknowledge a checked, idle pane and clear its uncertain-operation state")
     parser.add_argument("--show-output", action="store_true", help="capture stdout/stderr tail")
     parser.add_argument("--output-lines", type=int, default=40)
     parser.add_argument("--max-parallel", type=int, default=8)

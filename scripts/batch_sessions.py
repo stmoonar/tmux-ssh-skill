@@ -54,30 +54,24 @@ from tmuxlib import (
 VALID_EXPECT = {"marker", "disconnect", "ready", "json"}
 
 
-def _shell_identity(tmux: Tmux, session: str) -> dict | None:
-    """Best-effort fingerprint of the shell currently driving the pane.
+def _shell_identity(tmux: Tmux, session: str, timeout: float = 10.0) -> dict:
+    """Fingerprint the shell; an unanswered probe remains an unknown result.
 
     tmux only tracks the outermost pane process, so a nested shell exiting or a
     container shell dying leaves `pane_pid` unchanged. Asking the live shell for
-    its own pid detects those transitions, and a failure to answer is itself
-    strong evidence the shell is gone.
+    its own pid detects those transitions. A timeout is never proof of exit.
     """
-    try:
-        pane = tmux.active_pane(session)
-        info = tmux.pane_info(pane)
-        marker = new_marker("ID")
-        tmux.send_line(pane, f"printf '\\n%s pid=%s\\n' {marker} $$")
-        row = wait_for_marker(tmux, pane, marker, timeout=10.0, poll_interval=0.3,
-                              capture_lines=40)
-        fields = dict(part.split("=", 1) for part in row.split() if "=" in part)
-        return {
-            "pane": pane,
-            "pane_pid": info["pane_pid"],
-            "shell_pid": fields.get("pid"),
-            "current_command": info["current_command"],
-        }
-    except (TmuxError, RemoteTimeout, ValueError):
-        return None
+    pane = tmux.active_pane(session)
+    info = tmux.pane_info(pane)
+    marker = new_marker("ID")
+    tmux.send_line(pane, f"printf '\\n%s pid=%s\\n' {marker} $$")
+    row = wait_for_marker(tmux, pane, marker, timeout=timeout, poll_interval=0.3,
+                          capture_lines=40)
+    fields = dict(part.split("=", 1) for part in row.split() if "=" in part)
+    if not (fields.get("pid") or "").isdigit():
+        raise TmuxError("shell identity probe returned no valid PID")
+    return {"pane": pane, "pane_pid": info["pane_pid"],
+            "shell_pid": fields["pid"], "current_command": info["current_command"]}
 
 
 def _await_disconnect(
@@ -85,36 +79,27 @@ def _await_disconnect(
     session: str,
     pane: str,
     timeout: float,
-    before: dict | None = None,
+    before: dict,
 ) -> dict:
     """Wait until the shell that served the pane is gone.
 
     A restart that kills the SSH or container shell is a success here, not a
     failure, so nothing is ever resent into a dead shell.
     """
-    if before is None:
-        before = _shell_identity(tmux, session)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(1.0)
-        try:
-            current_pane = tmux.active_pane(session)
-        except TmuxError:
-            return {"disconnected": True, "reason": "session lost its panes"}
-        try:
-            info = tmux.pane_info(current_pane)
-        except TmuxError:
-            return {"disconnected": True, "reason": "pane disappeared"}
+        # A missing server/socket is not evidence of remote shell exit.
+        current_pane = tmux.active_pane(session)
+        info = tmux.pane_info(current_pane)
+        if current_pane != pane:
+            raise TmuxError("active pane changed; cannot infer whether the original shell exited")
         if info["dead"]:
             return {"disconnected": True, "reason": "pane reported dead"}
-        if current_pane != pane:
-            return {"disconnected": True, "reason": "active pane changed"}
-        after = _shell_identity(tmux, session)
-        if after is None:
-            return {"disconnected": True, "reason": "shell stopped answering"}
-        if before is None:
-            before = after
-            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        after = _shell_identity(tmux, session, timeout=min(10.0, remaining))
         if after["shell_pid"] and after["shell_pid"] != before["shell_pid"]:
             return {
                 "disconnected": True,
@@ -124,7 +109,7 @@ def _await_disconnect(
             }
         if after["pane_pid"] != before["pane_pid"]:
             return {"disconnected": True, "reason": "pane pid changed"}
-    return {"disconnected": False, "reason": f"shell still alive after {timeout:.0f}s"}
+    raise RemoteTimeout(f"shell exit was not confirmed within {timeout:.0f}s; inspect before retrying")
 
 
 def _await_ready(
@@ -141,13 +126,17 @@ def _await_ready(
         attempts += 1
         try:
             pane = tmux.active_pane(session)
-            outcome = run_shell(tmux, pane, ready_command, timeout=min(30.0, timeout))
+        except TmuxError as error:
+            last = str(error)
+        else:
+            # Retry only a completed nonzero probe. An unknown receipt propagates
+            # as TIMEOUT and must never enqueue another copy of the command.
+            remaining = deadline - time.monotonic()
+            outcome = run_shell(tmux, pane, ready_command, timeout=max(0.01, min(30.0, remaining)))
             if outcome["rc"] == 0:
                 return {"ready": True, "attempts": attempts, "pane": pane}
             last = f"rc={outcome['rc']}"
-        except (TmuxError, RemoteTimeout) as error:
-            last = str(error)
-        time.sleep(interval)
+        time.sleep(max(0.0, min(interval, deadline - time.monotonic())))
     return {"ready": False, "attempts": attempts, "last": last}
 
 

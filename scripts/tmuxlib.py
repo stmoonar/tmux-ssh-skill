@@ -27,7 +27,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 import zlib
@@ -39,17 +38,14 @@ if sys.platform == "win32":
     _script = os.path.abspath(sys.argv[0] or "scripts/X.py").replace("\\", "/")
     if _script[1:3] == ":/":
         _script = f"/mnt/{_script[0].lower()}{_script[2:]}"
-    # Git Bash decodes pipes as UTF-8, PowerShell as the ANSI code page.
     with contextlib.suppress(AttributeError, ValueError):
-        sys.stdout.reconfigure(
-            encoding="utf-8" if os.environ.get("MSYSTEM") else None, errors="replace"
-        )
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(json.dumps({
         "status": "FAIL",
         "error": "native Windows is not supported; run inside WSL "
                  "(Windows 下请在 WSL 中运行)",
-        "hint": f"wsl -e python3 {_script} ...",
-    }, ensure_ascii=False, indent=2))
+        "hint": f'wsl -d <distribution> -e python3 "{_script}" ...',
+    }, indent=2))
     sys.exit(2)
 
 import fcntl  # noqa: E402 - POSIX only, guarded above
@@ -65,6 +61,10 @@ IN_WSL = "microsoft" in platform.uname().release.lower() or "WSL_DISTRO_NAME" in
 
 class TmuxError(RuntimeError):
     """A tmux level failure: missing session, dead pane, bad socket."""
+
+
+class OutputPipeBusy(TmuxError):
+    """Download could not acquire a pipe; no remote payload was triggered."""
 
 
 class RemoteCommandError(RuntimeError):
@@ -201,21 +201,25 @@ class Tmux:
         self.run("delete-buffer", "-b", buffer_name, check=False)
 
     def pipe_pane_start(self, pane: str, command: str) -> None:
-        self.run("pipe-pane", "-t", pane, command)
+        if self.run("display-message", "-p", "-t", pane, "#{pane_pipe}").stdout.strip() == "1":
+            raise OutputPipeBusy("pane already has an output pipe; preserve it and use another pane")
+        # -o also preserves a pipe installed between the check and this call.
+        self.run("pipe-pane", "-o", "-t", pane, command)
 
     def pipe_pane_stop(self, pane: str) -> None:
         self.run("pipe-pane", "-t", pane, check=False)
 
 
 def lock_path(socket: str, session: str) -> Path:
+    socket = str(Path(socket).expanduser().resolve())
     key = hashlib.sha256(f"{socket}\0{session}".encode()).hexdigest()[:16]
-    root = Path(tempfile.gettempdir()) / "tmux-ssh-workflow-locks"
-    root.mkdir(parents=True, exist_ok=True)
+    root = Path("/tmp") / f"tmux-ssh-workflow-locks-{os.getuid()}"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root / f"{key}.lock"
 
 
 @contextlib.contextmanager
-def session_lock(socket: str, session: str, timeout: float = 900.0):
+def session_lock(socket: str, session: str, timeout: float = 900.0, recover: bool = False):
     """Serialise operations that share one PTY.
 
     Different sessions take different locks, so batch drivers stay parallel.
@@ -238,10 +242,38 @@ def session_lock(socket: str, session: str, timeout: float = 900.0):
                     ) from error
                 time.sleep(0.2)
         handle.seek(0)
-        handle.truncate()
-        handle.write(json.dumps({"pid": os.getpid(), "session": session, "at": time.time()}))
-        handle.flush()
-        yield
+        previous = handle.read()
+        try:
+            previous_state = json.loads(previous).get("state") if previous else None
+        except (ValueError, AttributeError):
+            previous_state = "UNKNOWN"
+        if previous_state in {"BUSY", "UNKNOWN"} and not recover:
+            raise TmuxError(
+                f"session {session} has an unfinished or timed-out operation; "
+                "inspect the pane, restore an idle shell, then use tmux_exec.py --recover-session"
+            )
+
+        def record(state: str, error: str = "") -> None:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps({"pid": os.getpid(), "session": session,
+                                     "at": time.time(), "state": state, "error": error}))
+            handle.flush()
+
+        # If the driver is killed, BUSY survives the released OS lock.
+        record("BUSY")
+        try:
+            yield
+        except BaseException as error:
+            uncertain = (
+                isinstance(error, (RemoteTimeout, TmuxError,
+                                   subprocess.CalledProcessError, KeyboardInterrupt))
+                and not isinstance(error, OutputPipeBusy)
+            )
+            record("UNKNOWN" if uncertain else "IDLE", str(error))
+            raise
+        else:
+            record("IDLE")
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(handle, fcntl.LOCK_UN)
@@ -352,13 +384,17 @@ def run_python(
         f"{indented}\n"
         "try:\n"
         "    __tsw_result={'ok':True,'result':__tsw_action()}\n"
+        "    __tsw_payload=json.dumps(__tsw_result)\n"
         "except BaseException:\n"
-        "    __tsw_result={'ok':False,'error':traceback.format_exc()}\n"
-        f"print('\\n'+{marker!r}+json.dumps(__tsw_result),flush=True)\n"
+        "    __tsw_payload=json.dumps({'ok':False,'error':traceback.format_exc()})\n"
+        f"print('\\n'+{marker!r}+__tsw_payload,flush=True)\n"
     )
+    # Validate the actual generated body, including embedded shell quoting,
+    # before writing anything to the remote pane.
+    compile(source, "<tmux-ssh remote action>", "exec")
     encoded = base64.b64encode(zlib.compress(source.encode())).decode()
     bootstrap = f"import base64,zlib;exec(zlib.decompress(base64.b64decode({encoded!r})))"
-    command = f"{python} -c {shlex.quote(bootstrap)}"
+    command = f"{shlex.quote(python)} -c {shlex.quote(bootstrap)}"
     if len(command.encode()) > MAX_INPUT_LINE:
         scratch = f"/tmp/tsw-rpc-{uuid.uuid4().hex}"
         tmux.send_line(pane, f": > {shlex.quote(scratch)}")
@@ -370,7 +406,7 @@ def run_python(
             f"p=Path({scratch!r});b=p.read_bytes();p.unlink();"
             "exec(zlib.decompress(base64.b64decode(b)))"
         )
-        command = f"{python} -c {shlex.quote(bootstrap)}"
+        command = f"{shlex.quote(python)} -c {shlex.quote(bootstrap)}"
     tmux.send_line(pane, command)
     row = wait_for_marker(tmux, pane, marker, timeout)
     try:

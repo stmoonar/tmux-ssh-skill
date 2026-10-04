@@ -71,6 +71,8 @@
 
 `disconnect` 的检测方式是让 shell 报告自己的 PID 并比对变化。tmux 只跟踪最外层 pane 进程，嵌套 shell 或容器 shell 退出时 `pane_pid` 不变，因此必须问 shell 本身。
 
+身份探测必须收到有效回执；超时不会判成断开成功。`ready_command` 只有在收到非零退出码后才会重试；回执超时就返回 `TIMEOUT`，并阻止后续写入，直到检查现场并显式恢复会话。
+
 ## 部署与运行
 
 ```json

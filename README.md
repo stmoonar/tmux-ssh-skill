@@ -126,7 +126,7 @@ scripts/
 ### 远端
 
 - 可被当前 pane 使用的类 Unix shell，脚本默认通过 `bash` 执行命令。
-- `python3`，用于结构化检查、任务状态和文件分片处理。
+- Python `3.8+` 的 `python3`，用于结构化检查、任务状态和文件分片处理；长期任务管理还需 `ps`。
 - `base64`、`stty` 等基础命令，用于 PTY 文件传输协议。
 - 如果使用容器流程，需要对应的容器运行时命令和权限。
 
@@ -134,7 +134,7 @@ scripts/
 
 只支持在 WSL 中运行，tmux socket 和 SSH 会话都要建在 WSL 里；原生 Windows Python 运行脚本会直接退出并提示 `wsl` 命令。
 
-- Claude Code 跑在 Windows 侧（默认）时，从 PowerShell 调用 `wsl -e python3 /mnt/c/<skill 路径>/scripts/X.py ...`；在 Git Bash 中调用时需加 `MSYS_NO_PATHCONV=1`，否则 POSIX 参数会被改写成 `C:/...`，脚本会报错拒绝。
+- Agent 跑在 Windows 侧时，从 PowerShell 调用 `wsl -d <发行版> -e python3 "/mnt/c/<skill 路径>/scripts/X.py" ...`；发行版和用户必须与创建 tmux 的环境一致，必要时加 `-u <用户>`。在 Git Bash 中调用时需加 `MSYS_NO_PATHCONV=1`，否则 POSIX 参数会被改写成 `C:/...`，脚本会报错拒绝。
 - Claude Code 跑在 WSL 里时，与 Linux 完全相同。
 - 本地文件参数可以写 `C:\...`，会自动转成 `/mnt/c/...`；`--socket` 和远程路径必须是 POSIX 路径。
 - PowerShell 不展开 `scripts/*.py`、`$((...))` 等 bash 语法，含这些写法的示例请放进 `wsl -e bash -lc '...'` 执行。
@@ -289,7 +289,7 @@ python3 scripts/remote_job.py collect \
 
 | 状态 | 含义 |
 |------|------|
-| `RUNNING` | 进程仍在运行，尚未写入退出码 |
+| `RUNNING` | 进程组内仍有运行的进程，即使主进程已写入退出码 |
 | `SUCCEEDED` | 任务退出码为 `0` |
 | `FAILED` | 任务退出码非 `0` |
 | `LOST` | 进程已不在，但没有可靠退出码，通常需要先查日志 |
@@ -297,20 +297,20 @@ python3 scripts/remote_job.py collect \
 
 任务重名时，`launch` 默认拒绝覆盖已有 job 目录。只有明确需要复用时才添加 `--reuse`。
 
-如果任务运行在容器中，可以在启动时记录容器名：
+容器任务从宿主机 shell 启动；`--container` 会通过容器运行时的 `exec` 真正进入指定容器执行命令。`--cwd` 是容器内目录，`--job-root` 是宿主机上的状态目录：
 
 ```bash
 python3 scripts/remote_job.py launch \
   --socket "$SOCKET" \
   --sessions remote-a \
   --job-id train-in-container \
-  --job-root /workspace/job-state \
+  --job-root /var/tmp/tmux-job-state \
   --container trainer \
   --cwd /workspace/project \
   --command './train.sh'
 ```
 
-停止时脚本会先按指定运行时停止容器，再处理记录的远程进程组。默认运行时为 `docker`，可以使用 `--container-runtime` 修改。
+该任务的 `status`、`stop`、`collect` 也从宿主机调用，并使用同一个宿主机状态目录。停止时脚本先按启动时保存的运行时和容器 ID 停容器，再确认进程组内没有仍运行的子进程。默认运行时为 `docker`，在 `launch` 时可用 `--container-runtime` 修改。旧版只有容器名的任务需在宿主机核对后处理。
 
 ## 多会话批量编排
 
@@ -393,7 +393,7 @@ python3 scripts/batch_sessions.py \
 
 下载时：
 
-1. 先通过 `pipe-pane` 接收输出，再触发远端读取，避免丢失首字节。
+1. 确认没有已有 `pipe-pane` 日志管道，再取得输出管道并触发远端读取。已有管道时拒绝下载并保留原日志。
 2. 远端按字节范围切片，逐片计算 SHA256 并编码输出。
 3. 本地只接受合法的 Base64 行，并校验每个分片。
 4. 全部分片合并后再次校验整文件 SHA256 和字节数。
@@ -427,9 +427,9 @@ Base64 会带来约 33% 的体积膨胀，PTY 逐行处理也会限制吞吐。�
 
 超时只表示在限定时间内没有看到回执。命令可能仍然在远端运行。正确做法是：
 
-1. 使用 `tmux_exec.py` 检查进程、文件或日志。
-2. 使用 `remote_job.py status` 查看长期任务状态。
-3. 确认远端没有继续执行或留下冲突后，再决定是否重试。
+1. 使用 `tmux -S SOCK capture-pane -p -t SESSION` 只读查看 pane，确认 shell 已空闲；必要时有针对性地退出传输读循环或交互程序。
+2. 超时或驱动被终止后，未完成标记会阻止后续写入。确认现场后，用 `tmux_exec.py --socket SOCK --sessions SESSION --recover-session --command 'stty echo; pwd' --show-output` 显式恢复。
+3. 恢复后用 `tmux_exec.py` 检查进程、文件或日志，或用 `remote_job.py status` 查看任务状态，再决定是否重试。
 
 不要在没有检查远端状态时直接重发，尤其是训练、部署和数据库变更类命令。
 

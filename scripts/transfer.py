@@ -28,9 +28,9 @@ import argparse
 import base64
 import gzip
 import hashlib
+import shlex
 import shutil
 import string
-import subprocess
 import sys
 import tempfile
 import time
@@ -39,12 +39,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tmuxlib import (
+    OutputPipeBusy,
     RemoteTimeout,
     Tmux,
-    TmuxError,
     emit,
     local_path,
-    new_marker,
     new_nonce,
     posix_arg,
     run_python,
@@ -54,9 +53,6 @@ from tmuxlib import (
 )
 
 DEFAULT_CHUNK_BYTES = 3 * 1024 * 1024
-SAFE_PATH_CHARS = set(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-"
-)
 BASE64_CHARS = set(string.ascii_letters + string.digits + "+/=")
 
 
@@ -72,9 +68,8 @@ def _is_base64_line(line: str) -> bool:
 def check_remote_path(path: str) -> None:
     if not path.startswith("/"):
         raise ValueError(f"remote path must be absolute: {path}")
-    bad = set(path) - SAFE_PATH_CHARS
-    if bad:
-        raise ValueError(f"remote path has unsafe characters {sorted(bad)}: {path}")
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        raise ValueError("remote path must not contain control characters")
 
 
 def _fold76(data: bytes) -> str:
@@ -105,13 +100,15 @@ def _upload_chunk(
         local_payload = handle.name
 
     encoded_remote = f"{staging}.b64-{nonce}"
+    encoded_arg = shlex.quote(encoded_remote)
+    staging_arg = shlex.quote(staging)
     remote_command = (
-        f"stty -echo; : > {encoded_remote}; printf '\\n{ready_marker}\\n'; "
+        f"stty -echo; : > {encoded_arg}; printf '\\n{ready_marker}\\n'; "
         f"while IFS= read -r line; do "
         f"if test \"$line\" = {end_marker}; then break; fi; "
-        f"printf '%s\\n' \"$line\" >> {encoded_remote}; done; "
-        f"base64 -d < {encoded_remote} >> {staging}; __tsw_rc=$?; "
-        f"rm -f {encoded_remote}; stty echo; "
+        f"printf '%s\\n' \"$line\" >> {encoded_arg}; done; "
+        f"base64 -d < {encoded_arg} >> {staging_arg}; __tsw_rc=$?; "
+        f"rm -f {encoded_arg}; stty echo; "
         f"printf '\\n{done_marker} rc=%s\\n' \"$__tsw_rc\""
     )
     try:
@@ -261,7 +258,12 @@ def _download_range(
     nonce = new_nonce()
     begin = f"TSW_B64_DL_BEGIN_{nonce}"
     end = f"TSW_B64_DL_END_{nonce}"
-    tap = Path(tempfile.mkstemp(prefix="tsw-tap-")[1])
+    # Close the descriptor immediately; every range must release its tap even
+    # when staging, receipt polling or decoding fails.
+    with tempfile.NamedTemporaryFile(prefix="tsw-tap-", delete=False) as handle:
+        tap = Path(handle.name)
+    ready = Path(str(tap) + ".ready")
+    pipe_owned = False
     helper = f"/tmp/tsw-dl-{nonce}.py"
     script = (
         "import base64,hashlib,sys\n"
@@ -283,13 +285,23 @@ def _download_range(
             tmux,
             pane,
             "from pathlib import Path\n"
-            f"Path({helper!r}).write_text({script!r})\n"
+            f"Path({helper!r}).write_text({script!r}, encoding='utf-8')\n"
             "return True",
             timeout=60.0,
             python=python,
         )
-        tmux.pipe_pane_start(pane, f"cat >> '{tap}'")
-        tmux.send_line(pane, f"{python} {helper}; rm -f {helper}")
+        tmux.pipe_pane_start(
+            pane, f"printf ready > {shlex.quote(str(ready))} && exec cat >> {shlex.quote(str(tap))}"
+        )
+        # pipe-pane -o leaves an existing pipe intact. Only a handshake from
+        # our command proves ownership, so a race cannot stop somebody's log.
+        pipe_deadline = time.monotonic() + min(10.0, timeout)
+        while not ready.exists():
+            if time.monotonic() >= pipe_deadline:
+                raise OutputPipeBusy("download output pipe was not acquired; existing logging is preserved")
+            time.sleep(0.05)
+        pipe_owned = True
+        tmux.send_line(pane, f"{shlex.quote(python)} {shlex.quote(helper)}; rm -f {shlex.quote(helper)}")
         deadline = time.monotonic() + timeout
         while True:
             text = tap.read_text(encoding="utf-8", errors="replace") if tap.exists() else ""
@@ -300,37 +312,41 @@ def _download_range(
                     f"download range {offset}+{length} did not finish within {timeout:.0f}s"
                 )
             time.sleep(0.3)
+        text = tap.read_text(encoding="utf-8", errors="replace").replace("\r", "")
+        header = None
+        payload_lines: list[str] = []
+        collecting = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if header is None and stripped.startswith(begin + " sha="):
+                header = stripped
+                collecting = True
+                continue
+            if stripped == end:
+                collecting = False
+                continue
+            if collecting and stripped and _is_base64_line(stripped):
+                payload_lines.append(stripped)
+        if header is None:
+            raise RuntimeError("download range produced no header marker")
+        fields = dict(part.split("=", 1) for part in header.split() if "=" in part)
+        data = base64.b64decode("".join(payload_lines), validate=True)
+        local_sha = hashlib.sha256(data).hexdigest()
+        if (local_sha != fields.get("sha") or str(len(data)) != fields.get("size")
+                or len(data) != length):
+            raise RuntimeError(
+                f"range verification failed: local sha={local_sha} size={len(data)} "
+                f"remote sha={fields.get('sha')} size={fields.get('size')}"
+            )
+        with open(dest, "ab") as handle:
+            handle.write(data)
     finally:
-        tmux.pipe_pane_stop(pane)
-
-    text = tap.read_text(encoding="utf-8", errors="replace").replace("\r", "")
-    tap.unlink(missing_ok=True)
-    header = None
-    payload_lines: list[str] = []
-    collecting = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if header is None and stripped.startswith(begin + " sha="):
-            header = stripped
-            collecting = True
-            continue
-        if stripped == end:
-            collecting = False
-            continue
-        if collecting and stripped and _is_base64_line(stripped):
-            payload_lines.append(stripped)
-    if header is None:
-        raise RuntimeError("download range produced no header marker")
-    fields = dict(part.split("=", 1) for part in header.split() if "=" in part)
-    data = base64.b64decode("".join(payload_lines))
-    local_sha = hashlib.sha256(data).hexdigest()
-    if local_sha != fields.get("sha") or str(len(data)) != fields.get("size"):
-        raise RuntimeError(
-            f"range verification failed: local sha={local_sha} size={len(data)} "
-            f"remote sha={fields.get('sha')} size={fields.get('size')}"
-        )
-    with open(dest, "ab") as handle:
-        handle.write(data)
+        try:
+            if pipe_owned:
+                tmux.pipe_pane_stop(pane)
+        finally:
+            ready.unlink(missing_ok=True)
+            tap.unlink(missing_ok=True)
 
 
 def get_one(args: argparse.Namespace, session: str) -> dict:
@@ -348,6 +364,7 @@ def get_one(args: argparse.Namespace, session: str) -> dict:
         if dest.exists() and not args.overwrite:
             raise FileExistsError(f"local destination exists: {dest}")
         part.unlink(missing_ok=True)
+        part.touch()
 
         with session_lock(args.socket, session, timeout=args.lock_timeout):
             pane = tmux.active_pane(session)
@@ -430,6 +447,10 @@ def main() -> int:
     if not names:
         parser.error("provide --session or --sessions")
     sessions = [name.strip() for name in names.split(",") if name.strip()]
+    if not sessions:
+        parser.error("provide at least one nonempty session name")
+    if args.chunk_bytes <= 0 or args.timeout <= 0:
+        parser.error("--chunk-bytes and --timeout must be positive")
     args.session_list = sessions
 
     if args.mode == "put" and not args.source:

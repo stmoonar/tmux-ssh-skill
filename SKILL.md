@@ -1,6 +1,6 @@
 ---
 name: tmux-ssh-workflow
-description: 通过本机指定的 tmux socket 和一个或多个 tmux 会话名，复用会话中已建立的 SSH 或容器 shell，在远程服务器上执行命令、传输文件、启动与监控长期任务、停止远程任务，并支持容器重启后的重新进入与断线接管。文件传输使用 tmux 通道内的 Base64 分块协议，全程无需鉴权和人工参与，带分块与整体 SHA256 校验、原子改名。支持多会话并行编排（如批量退出容器、重启、重新进入）。当用户提供 tmux socket 与会话名、要求在远程机器跑任务或收取远程产物、或需要跨多台机器同步执行同一组操作时使用。不适用于新建 SSH 连接、管理远程主机本身或本地无 tmux 通道的场景。
+description: 通过本机指定的 tmux socket 和一个或多个 tmux 会话名，复用会话中已鉴权的 SSH 或容器 shell，执行远程命令、传输文件、管理长期任务及编排容器重启。文件传输带下载分块与上传及下载整文件 SHA256 校验、原子改名。适用于用户提供 tmux socket 与会话名、要求运行远程任务或收取产物，以及跨多会话同步操作。不适用于新建 SSH 连接或本地无 tmux 通道的场景。macOS 原生运行，Windows 通过 WSL 运行。
 ---
 
 # tmux SSH 工作流
@@ -22,14 +22,18 @@ description: 通过本机指定的 tmux socket 和一个或多个 tmux 会话名
 3. **任务状态存在远程文件里，不存在 tmux 回滚缓冲里。** 本地进程退出后仍能接管。
 4. **停止只针对远程任务。** 绝不执行 `tmux kill-session`、`kill-window`、`kill-pane`，会话必须留存以便排查。
 
+## macOS / Linux
+
+本地需 Python 3.10+、tmux 和可访问的 socket；脚本原生运行。远端需 Python 3.8+、bash、base64、stty；管理长期任务还需 `ps`。macOS 本地路径和远端任务路径含空格时，要在调用命令中引用完整参数。
+
 ## Windows
 
 只支持在 WSL 中运行：tmux socket 和其中的 SSH/容器会话都必须建在 WSL 里。原生 Windows Python 连不上 WSL 的 socket，脚本会直接退出并提示对应的 `wsl` 命令。
 
-- **默认（Claude Code 跑在 Windows 侧）**：优先用 PowerShell 工具调用 `wsl -e python3 /mnt/c/<skill 路径>/scripts/X.py ...`，参数原样传入 WSL。若用 Bash 工具（Git Bash），命令前必须加 `MSYS_NO_PATHCONV=1`，否则 `/tmp/x` 这类 POSIX 参数会被改写成 `C:/...`；`--socket` 和远程路径被改写时脚本会报错拒绝执行。
+- **Agent 跑在 Windows 侧**：优先用 PowerShell 调用 `wsl -d <发行版> -e python3 "/mnt/c/<skill 路径>/scripts/X.py" ...`。发行版和用户必须与创建 tmux 的环境一致；必要时加 `-u <用户>`。若用 Git Bash，命令前必须加 `MSYS_NO_PATHCONV=1`，否则 `/tmp/x` 等参数会被改写成 `C:/...`；脚本会拒绝被改写的 socket 和远程路径。
 - **Claude Code 跑在 WSL 里时**：直接按下文 Linux 用法调用，无需 `wsl -e`。
 - **路径**：本地文件参数（`--source`、`--dest`、`--python-file`、`--plan`）可以直接写 `C:\...`，会自动转成 `/mnt/c/...`；远程路径必须是 POSIX 路径。
-- **超时**：工具默认超时 120 秒。传输和长操作要给工具调用更大的 timeout，或用 `run_in_background`。调用被中断后先看远端 pane 状态：若停在传输读循环里（回显被 `stty -echo` 关闭），先 Ctrl-C 再执行 `stty echo` 恢复，确认没有半成品后再重试，禁止盲目重发。
+- **超时**：按当前 Agent 工具的实际超时设置，为长传输留足时间。调用被中断后先只读查看 pane；若停在传输读循环里，确认可以中断后用 Ctrl-C 退出，再按下文恢复会话。
 
 ## 标准流程
 
@@ -88,7 +92,7 @@ python3 scripts/remote_job.py collect --socket S --sessions n1 --job-id run-001 
 
 状态取值：`RUNNING`、`SUCCEEDED`、`FAILED`、`LOST`、`MISSING`。`LOST` 表示进程已不在但没有退出码，通常是被外部杀掉或机器重启，需要查日志而不是直接重跑。
 
-任务在容器内运行时，`launch` 传 `--container NAME`，`stop` 会先停容器再处理进程组。
+容器任务必须从**宿主机 shell** 调用 `launch --container NAME`：脚本通过容器运行时的 `exec` 启动命令，`--cwd` 是容器内目录，`--job-root` 是宿主机状态目录。后续 `status`、`stop`、`collect` 都在宿主机调用。`stop` 按启动时记录的容器 ID 和运行时停容器，再确认宿主机进程组已退出。旧版仅记录容器名的任务不能自动停止，应从宿主机核对后处理。
 
 **多会话编排**
 
@@ -112,7 +116,16 @@ python3 scripts/batch_sessions.py --socket S --plan plan.json
 
 **是否压缩。** 源码、日志、JSON 一律加 `--compress`。已压缩的归档、图片、模型权重不要加，只会浪费 CPU。
 
-**失败后的动作。** 传输或执行报 `TIMEOUT` 时，先用 `tmux_exec.py` 检查远端实际状态和目标文件，确认没有半成品再重试。所有上传都写临时 `.part-<nonce>` 后才原子改名，因此失败不会留下可用但内容错误的正式文件。
+**失败后的动作。** 超时或驱动被终止后，会话保留未完成标记，后续脚本拒绝继续写入。先用 `tmux -S SOCK capture-pane -p -t SESSION` 只读查看现场，确认 shell 已空闲；必要时有针对性地退出读循环或交互程序。然后显式恢复并检查：
+
+```bash
+python3 scripts/tmux_exec.py --socket SOCK --sessions SESSION \
+  --recover-session --command 'stty echo; pwd' --show-output
+```
+
+`--recover-session` 是对“已检查且 shell 空闲”的确认，不会自动中止任务或重发旧命令。恢复后再检查进程、文件和日志，决定是否重试。上传通过暂存文件校验后原子改名。
+
+**下载与终端日志。** 下载需要独占 pane 的输出管道；已有 `pipe-pane` 日志时拒绝下载，保留原管道。换用没有输出管道的 pane，或在明确授权后调整原日志设置。
 
 **并发边界。** 同一会话被两个驱动同时使用会交错污染回执，因此每个 `socket + 会话` 有独立文件锁。看到锁超时不要绕过，先查是谁在用。
 
