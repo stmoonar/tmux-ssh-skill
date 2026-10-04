@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 from tmuxlib import (
     RemoteCommandError,
@@ -23,6 +22,8 @@ from tmuxlib import (
     Tmux,
     TmuxError,
     emit,
+    local_path,
+    posix_arg,
     run_python,
     run_shell,
     session_lock,
@@ -76,10 +77,10 @@ def exec_one(args: argparse.Namespace, session: str, body: str | None) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--socket", required=True)
+    parser.add_argument("--socket", required=True, type=posix_arg)
     parser.add_argument("--sessions", required=True)
     parser.add_argument("--command")
-    parser.add_argument("--python-file", type=Path, help="file holding a Python body ending in return")
+    parser.add_argument("--python-file", type=local_path, help="file holding a Python body ending in return")
     parser.add_argument("--python", default="python3", help="remote interpreter for --python-file")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--lock-timeout", type=float, default=900.0)

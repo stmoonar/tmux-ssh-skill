@@ -36,14 +36,15 @@ import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 from tmuxlib import (
     RemoteTimeout,
     Tmux,
     TmuxError,
     emit,
+    local_path,
     new_marker,
+    posix_arg,
     run_python,
     run_shell,
     session_lock,
@@ -214,8 +215,8 @@ def run_step(args: argparse.Namespace, step: dict, session: str) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--socket", required=True)
-    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--socket", required=True, type=posix_arg)
+    parser.add_argument("--plan", type=local_path, required=True)
     parser.add_argument("--sessions", help="override the plan's session list")
     parser.add_argument("--default-timeout", type=float, default=120.0)
     parser.add_argument("--lock-timeout", type=float, default=1800.0)

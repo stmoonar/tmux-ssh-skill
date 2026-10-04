@@ -43,8 +43,10 @@ from tmuxlib import (
     Tmux,
     TmuxError,
     emit,
+    local_path,
     new_marker,
     new_nonce,
+    posix_arg,
     run_python,
     session_lock,
     sha256_file,
@@ -94,7 +96,10 @@ def _upload_chunk(
     done_marker = f"TSW_B64_DONE_{nonce}"
     buffer_name = f"tsw-up-{nonce}"
 
-    with tempfile.NamedTemporaryFile("w", suffix=".b64", delete=False) as handle:
+    # Pin LF and ASCII: a CRLF row would never match the remote end marker.
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".b64", delete=False, encoding="ascii", newline="\n"
+    ) as handle:
         handle.write(_fold76(payload))
         handle.write(f"\n{end_marker}\n")
         local_payload = handle.name
@@ -171,6 +176,7 @@ def put_one(args: argparse.Namespace, session: str) -> dict:
                 "stage.touch()\n"
                 "return {'parent': str(target.parent)}",
                 timeout=args.timeout,
+                python=args.python,
             )
             row["remote_parent"] = prepared.get("parent")
 
@@ -215,6 +221,7 @@ def put_one(args: argparse.Namespace, session: str) -> dict:
                 "stage.replace(target)\n"
                 "return {'sha256':final_sha,'size':final_size,'path':str(target)}",
                 timeout=max(args.timeout, 300.0),
+                python=args.python,
             )
             row.update(verified)
             row["compressed"] = compressed
@@ -242,6 +249,7 @@ def _download_range(
     length: int,
     dest: Path,
     timeout: float,
+    python: str = "python3",
 ) -> None:
     """Fetch one byte range and append it to the local staging file.
 
@@ -278,12 +286,13 @@ def _download_range(
             f"Path({helper!r}).write_text({script!r})\n"
             "return True",
             timeout=60.0,
+            python=python,
         )
         tmux.pipe_pane_start(pane, f"cat >> '{tap}'")
-        tmux.send_line(pane, f"python3 {helper}; rm -f {helper}")
+        tmux.send_line(pane, f"{python} {helper}; rm -f {helper}")
         deadline = time.monotonic() + timeout
         while True:
-            text = tap.read_text(errors="replace") if tap.exists() else ""
+            text = tap.read_text(encoding="utf-8", errors="replace") if tap.exists() else ""
             if any(line.strip() == end for line in text.splitlines()):
                 break
             if time.monotonic() >= deadline:
@@ -294,7 +303,7 @@ def _download_range(
     finally:
         tmux.pipe_pane_stop(pane)
 
-    text = tap.read_text(errors="replace").replace("\r", "")
+    text = tap.read_text(encoding="utf-8", errors="replace").replace("\r", "")
     tap.unlink(missing_ok=True)
     header = None
     payload_lines: list[str] = []
@@ -357,6 +366,7 @@ def get_one(args: argparse.Namespace, session: str) -> dict:
                 "        h.update(blk)\n"
                 "return {'sha256':h.hexdigest(),'size':p.stat().st_size}",
                 timeout=args.timeout,
+                python=args.python,
             )
             total = int(meta["size"])
             row["remote_sha256"] = meta["sha256"]
@@ -366,7 +376,8 @@ def get_one(args: argparse.Namespace, session: str) -> dict:
             while offset < total:
                 length = min(args.chunk_bytes, total - offset)
                 _download_range(
-                    tmux, pane, args.remote_path, offset, length, part, args.timeout
+                    tmux, pane, args.remote_path, offset, length, part, args.timeout,
+                    args.python,
                 )
                 offset += length
                 chunks += 1
@@ -400,15 +411,16 @@ def get_one(args: argparse.Namespace, session: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["put", "get"])
-    parser.add_argument("--socket", required=True)
+    parser.add_argument("--socket", required=True, type=posix_arg)
     parser.add_argument("--session")
     parser.add_argument("--sessions")
-    parser.add_argument("--source")
-    parser.add_argument("--remote-path", required=True)
-    parser.add_argument("--dest")
+    parser.add_argument("--source", type=local_path)
+    parser.add_argument("--remote-path", required=True, type=posix_arg)
+    parser.add_argument("--dest", type=local_path)
     parser.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--lock-timeout", type=float, default=1800.0)
+    parser.add_argument("--python", default="python3", help="remote interpreter")
     parser.add_argument("--compress", action="store_true", help="gzip before upload")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max-parallel", type=int, default=4)

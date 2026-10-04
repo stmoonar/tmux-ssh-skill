@@ -22,6 +22,15 @@ description: 通过本机指定的 tmux socket 和一个或多个 tmux 会话名
 3. **任务状态存在远程文件里，不存在 tmux 回滚缓冲里。** 本地进程退出后仍能接管。
 4. **停止只针对远程任务。** 绝不执行 `tmux kill-session`、`kill-window`、`kill-pane`，会话必须留存以便排查。
 
+## Windows
+
+只支持在 WSL 中运行：tmux socket 和其中的 SSH/容器会话都必须建在 WSL 里。原生 Windows Python 连不上 WSL 的 socket，脚本会直接退出并提示对应的 `wsl` 命令。
+
+- **默认（Claude Code 跑在 Windows 侧）**：优先用 PowerShell 工具调用 `wsl -e python3 /mnt/c/<skill 路径>/scripts/X.py ...`，参数原样传入 WSL。若用 Bash 工具（Git Bash），命令前必须加 `MSYS_NO_PATHCONV=1`，否则 `/tmp/x` 这类 POSIX 参数会被改写成 `C:/...`；`--socket` 和远程路径被改写时脚本会报错拒绝执行。
+- **Claude Code 跑在 WSL 里时**：直接按下文 Linux 用法调用，无需 `wsl -e`。
+- **路径**：本地文件参数（`--source`、`--dest`、`--python-file`、`--plan`）可以直接写 `C:\...`，会自动转成 `/mnt/c/...`；远程路径必须是 POSIX 路径。
+- **超时**：工具默认超时 120 秒。传输和长操作要给工具调用更大的 timeout，或用 `run_in_background`。调用被中断后先看远端 pane 状态：若停在传输读循环里（回显被 `stty -echo` 关闭），先 Ctrl-C 再执行 `stty echo` 恢复，确认没有半成品后再重试，禁止盲目重发。
+
 ## 标准流程
 
 按顺序执行，除有明确理由外不要跳步。

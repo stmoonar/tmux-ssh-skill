@@ -30,6 +30,14 @@ git clone https://github.com/stmoonar/tmux-ssh-skill.git \
   ~/.claude/skills/tmux-ssh-workflow
 ```
 
+Windows 上 Claude Code 默认跑在 PowerShell 侧，在 PowerShell 中执行（若 Claude Code 跑在 WSL 里，则在 WSL 中执行上面的命令）：
+
+```powershell
+git clone https://github.com/stmoonar/tmux-ssh-skill.git "$env:USERPROFILE\.claude\skills\tmux-ssh-workflow"
+```
+
+脚本本身仍需在 WSL 中运行，见下文 [Windows（WSL）](#windowswsl)。
+
 安装完成后，确认目录中包含：
 
 ```text
@@ -121,6 +129,16 @@ scripts/
 - `python3`，用于结构化检查、任务状态和文件分片处理。
 - `base64`、`stty` 等基础命令，用于 PTY 文件传输协议。
 - 如果使用容器流程，需要对应的容器运行时命令和权限。
+
+### Windows（WSL）
+
+只支持在 WSL 中运行，tmux socket 和 SSH 会话都要建在 WSL 里；原生 Windows Python 运行脚本会直接退出并提示 `wsl` 命令。
+
+- Claude Code 跑在 Windows 侧（默认）时，从 PowerShell 调用 `wsl -e python3 /mnt/c/<skill 路径>/scripts/X.py ...`；在 Git Bash 中调用时需加 `MSYS_NO_PATHCONV=1`，否则 POSIX 参数会被改写成 `C:/...`，脚本会报错拒绝。
+- Claude Code 跑在 WSL 里时，与 Linux 完全相同。
+- 本地文件参数可以写 `C:\...`，会自动转成 `/mnt/c/...`；`--socket` 和远程路径必须是 POSIX 路径。
+- PowerShell 不展开 `scripts/*.py`、`$((...))` 等 bash 语法，含这些写法的示例请放进 `wsl -e bash -lc '...'` 执行。
+- 长传输注意 Agent 工具的默认超时与中断后的检查方式，见 [`SKILL.md`](./SKILL.md) 的 Windows 一节。
 
 ## 脚本用法
 

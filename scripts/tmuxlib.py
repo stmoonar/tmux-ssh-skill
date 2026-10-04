@@ -15,26 +15,52 @@ Design constraints baked into this module:
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import contextlib
 import errno
-import fcntl
 import hashlib
 import json
 import os
+import platform
+import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 import zlib
 from pathlib import Path
 
+if sys.platform == "win32":
+    # tmux, its socket and fcntl only exist inside WSL; native Windows Python
+    # cannot reach a WSL socket. Fail before `import fcntl` raises instead.
+    _script = os.path.abspath(sys.argv[0] or "scripts/X.py").replace("\\", "/")
+    if _script[1:3] == ":/":
+        _script = f"/mnt/{_script[0].lower()}{_script[2:]}"
+    # Git Bash decodes pipes as UTF-8, PowerShell as the ANSI code page.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(
+            encoding="utf-8" if os.environ.get("MSYSTEM") else None, errors="replace"
+        )
+    print(json.dumps({
+        "status": "FAIL",
+        "error": "native Windows is not supported; run inside WSL "
+                 "(Windows 下请在 WSL 中运行)",
+        "hint": f"wsl -e python3 {_script} ...",
+    }, ensure_ascii=False, indent=2))
+    sys.exit(2)
+
+import fcntl  # noqa: E402 - POSIX only, guarded above
+
 MARKER_PREFIX = "TSW"
 # A canonical PTY input line tops out near 4 KiB; stay well below it.
 MAX_INPUT_LINE = 3500
 CHUNK_CHARS = 1800
 CAPTURE_LINES = 2000
+DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+IN_WSL = "microsoft" in platform.uname().release.lower() or "WSL_DISTRO_NAME" in os.environ
 
 
 class TmuxError(RuntimeError):
@@ -384,5 +410,38 @@ def probe_session(tmux: Tmux, session: str, timeout: float = 30.0) -> dict:
     }
 
 
+def local_path(value: str) -> Path:
+    """argparse type for LOCAL file args; never use it on remote paths.
+
+    Under WSL a caller on the Windows side may hand in `C:\\x\\f` or `C:/x/f`;
+    map it onto `/mnt/c/x/f` so the file is found from inside WSL.
+    """
+    if IN_WSL and DRIVE_PATH.match(value):
+        with contextlib.suppress(OSError):
+            done = subprocess.run(["wslpath", "-u", value], capture_output=True, text=True)
+            if done.returncode == 0 and done.stdout.strip():
+                return Path(done.stdout.strip())
+        return Path(f"/mnt/{value[0].lower()}/{value[3:]}".replace("\\", "/"))
+    return Path(value).expanduser()
+
+
+def posix_arg(value: str) -> str:
+    """argparse type for args that must stay POSIX: the socket and remote paths.
+
+    Git Bash (MSYS) rewrites `/tmp/x` into `C:/Users/.../Temp/x` or
+    `C:/Program Files/Git/tmp/x` before WSL ever sees it.
+    """
+    if DRIVE_PATH.match(value) or ":/Program Files/Git/" in value:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} looks like a POSIX path rewritten by Git Bash; "
+            "prefix the command with MSYS_NO_PATHCONV=1 or call it from PowerShell"
+        )
+    return value
+
+
 def emit(payload: object) -> None:
+    # A remote command that already ran must not lose its receipt to a
+    # UnicodeEncodeError under a C/POSIX or other non-UTF-8 locale.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(json.dumps(payload, ensure_ascii=False, indent=2))

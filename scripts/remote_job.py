@@ -31,6 +31,7 @@ from tmuxlib import (
     Tmux,
     TmuxError,
     emit,
+    posix_arg,
     run_python,
     session_lock,
 )
@@ -271,16 +272,16 @@ HANDLERS = {"launch": launch, "status": status, "stop": stop, "collect": collect
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=sorted(HANDLERS))
-    parser.add_argument("--socket", required=True)
+    parser.add_argument("--socket", required=True, type=posix_arg)
     parser.add_argument("--sessions", required=True)
     parser.add_argument("--job-id", required=True)
-    parser.add_argument("--job-root", required=True, help="absolute remote directory for job state")
+    parser.add_argument("--job-root", required=True, type=posix_arg, help="absolute remote directory for job state")
     parser.add_argument("--command", help="remote command for launch")
-    parser.add_argument("--cwd", default="", help="remote working directory")
+    parser.add_argument("--cwd", default="", type=posix_arg, help="remote working directory")
     parser.add_argument("--container", default="", help="container name or id to stop with the job")
     parser.add_argument("--container-runtime", default="docker")
     parser.add_argument("--grace-seconds", type=float, default=30.0)
-    parser.add_argument("--archive-path", default="")
+    parser.add_argument("--archive-path", default="", type=posix_arg)
     parser.add_argument("--log-lines", type=int, default=40)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--lock-timeout", type=float, default=900.0)

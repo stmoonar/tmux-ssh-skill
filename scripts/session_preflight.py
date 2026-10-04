@@ -16,7 +16,15 @@ import argparse
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-from tmuxlib import Tmux, TmuxError, emit, probe_session, run_shell, session_lock
+from tmuxlib import (
+    Tmux,
+    TmuxError,
+    emit,
+    posix_arg,
+    probe_session,
+    run_shell,
+    session_lock,
+)
 
 
 def check_one(args: argparse.Namespace, session: str) -> dict:
@@ -55,12 +63,12 @@ def check_one(args: argparse.Namespace, session: str) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--socket", required=True)
+    parser.add_argument("--socket", required=True, type=posix_arg)
     parser.add_argument("--sessions", required=True, help="comma separated tmux session names")
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--lock-timeout", type=float, default=300.0)
     parser.add_argument("--expect-host-contains")
-    parser.add_argument("--expect-cwd-prefix")
+    parser.add_argument("--expect-cwd-prefix", type=posix_arg)
     parser.add_argument("--require-command", action="append", default=[])
     parser.add_argument("--max-parallel", type=int, default=8)
     args = parser.parse_args()
