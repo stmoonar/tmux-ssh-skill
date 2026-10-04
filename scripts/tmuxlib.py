@@ -200,10 +200,15 @@ class Tmux:
     def delete_buffer(self, buffer_name: str) -> None:
         self.run("delete-buffer", "-b", buffer_name, check=False)
 
-    def pipe_pane_start(self, pane: str, command: str) -> None:
+    def require_no_pipe(self, pane: str) -> None:
         if self.run("display-message", "-p", "-t", pane, "#{pane_pipe}").stdout.strip() == "1":
             raise OutputPipeBusy("pane already has an output pipe; preserve it and use another pane")
-        # -o also preserves a pipe installed between the check and this call.
+
+    def pipe_pane_start(self, pane: str, command: str) -> None:
+        self.require_no_pipe(pane)
+        # Race: -o toggles, so a pipe installed between the check and this
+        # call is closed and ours is not opened. Callers detect that through a
+        # handshake and refuse; the closed pipe cannot be restored.
         self.run("pipe-pane", "-o", "-t", pane, command)
 
     def pipe_pane_stop(self, pane: str) -> None:

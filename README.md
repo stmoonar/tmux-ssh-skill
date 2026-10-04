@@ -297,7 +297,9 @@ python3 scripts/remote_job.py collect \
 
 任务重名时，`launch` 默认拒绝覆盖已有 job 目录。只有明确需要复用时才添加 `--reuse`。
 
-容器任务从宿主机 shell 启动；`--container` 会通过容器运行时的 `exec` 真正进入指定容器执行命令。`--cwd` 是容器内目录，`--job-root` 是宿主机上的状态目录：
+如果 pane 本身已经在容器里（例如常驻一个 `docker exec -it <ctr> bash`），直接在这个 pane 上调用 `remote_job.py`，**不要**加 `--container`，也不要为此退出容器：任务会作为普通 shell 任务在容器内运行，`status`、`stop`、`collect` 用法不变。此模式要求容器内有 bash、Python 3.8+ 和 procps 提供的 `ps`（不支持 BusyBox 的 `ps`）；缺少时 `launch` 直接失败且不会启动任务。容器可能被删除重建时，`--job-root` 应放在挂载的持久目录上。
+
+`--container` 只用于 pane 在宿主机、需要在容器里启动和停止任务的场景。此时容器任务从宿主机 shell 启动；`--container` 会通过容器运行时的 `exec` 真正进入指定容器执行命令。`--cwd` 是容器内目录，`--job-root` 是宿主机上的状态目录：
 
 ```bash
 python3 scripts/remote_job.py launch \
@@ -458,13 +460,15 @@ tmux-ssh-skill/
 │   ├── plan-examples.md             # 批量编排计划、容器重启和部署示例
 │   ├── transfer-protocol.md         # Base64 分块传输协议与性能说明
 │   └── troubleshooting.md           # 会话、执行、传输和任务故障排查
-└── scripts/
-    ├── batch_sessions.py            # 多会话阶段编排器
-    ├── remote_job.py                # 远程长期任务管理器
-    ├── session_preflight.py         # 会话预检器
-    ├── tmux_exec.py                 # 远程命令和 Python 结构化执行器
-    ├── tmuxlib.py                   # tmux、回执、锁和远程执行基础库
-    └── transfer.py                  # 基于 tmux PTY 的文件传输器
+├── scripts/
+│   ├── batch_sessions.py            # 多会话阶段编排器
+│   ├── remote_job.py                # 远程长期任务管理器
+│   ├── session_preflight.py         # 会话预检器
+│   ├── tmux_exec.py                 # 远程命令和 Python 结构化执行器
+│   ├── tmuxlib.py                   # tmux、回执、锁和远程执行基础库
+│   └── transfer.py                  # 基于 tmux PTY 的文件传输器
+└── tests/
+    └── test_workflow.py             # 基于一次性 tmux server 的端到端回归测试
 ```
 
 ## 常用场景
@@ -512,6 +516,16 @@ tmux-ssh-skill/
 ```bash
 python3 -m py_compile scripts/*.py
 ```
+
+### 测试
+
+回归测试只用标准库 `unittest`，在 Linux、macOS 或 WSL 中从仓库根目录运行：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+每个用例在临时目录的 socket 上启动一次性 tmux server，用 `bash --norc --noprofile` 模拟远端 shell，调用真实脚本并断言 JSON 输出，结束时只关闭该 server 并清理临时文件。本机没有 tmux 时整套测试自动跳过；完整运行约需 1～2 分钟。
 
 批量计划修改后，先使用 `--dry-run` 检查步骤，不要直接把包含重启、退出容器或删除文件的计划发送到远端。
 

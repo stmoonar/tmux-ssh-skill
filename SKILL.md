@@ -92,7 +92,9 @@ python3 scripts/remote_job.py collect --socket S --sessions n1 --job-id run-001 
 
 状态取值：`RUNNING`、`SUCCEEDED`、`FAILED`、`LOST`、`MISSING`。`LOST` 表示进程已不在但没有退出码，通常是被外部杀掉或机器重启，需要查日志而不是直接重跑。
 
-容器任务必须从**宿主机 shell** 调用 `launch --container NAME`：脚本通过容器运行时的 `exec` 启动命令，`--cwd` 是容器内目录，`--job-root` 是宿主机状态目录。后续 `status`、`stop`、`collect` 都在宿主机调用。`stop` 按启动时记录的容器 ID 和运行时停容器，再确认宿主机进程组已退出。旧版仅记录容器名的任务不能自动停止，应从宿主机核对后处理。
+**pane 已在容器内**（如常驻 `docker exec -it <ctr> bash`）时，直接调用 `remote_job.py`、**不加** `--container`，不要为此退出容器：任务作为普通 shell 任务在容器内运行，`status`、`stop` 照常。此时容器内需有 bash、python3 ≥ 3.8 和 procps 的 `ps`（不支持 BusyBox `ps`）；容器可能被重建时，`--job-root` 放在挂载的持久目录。
+
+`--container` 只用于 pane 在宿主机、要在容器里启停任务的情况，必须从**宿主机 shell** 调用 `launch --container NAME`：脚本通过容器运行时的 `exec` 启动命令，`--cwd` 是容器内目录，`--job-root` 是宿主机状态目录。后续 `status`、`stop`、`collect` 都在宿主机调用。`stop` 按启动时记录的容器 ID 和运行时停容器，再确认宿主机进程组已退出。旧版仅记录容器名的任务不能自动停止，应从宿主机核对后处理。
 
 **多会话编排**
 

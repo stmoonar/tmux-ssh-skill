@@ -77,8 +77,14 @@ def launch(args: argparse.Namespace, session: str) -> dict:
             result = run_python(
                 tmux,
                 pane,
-                "import json,os,shlex,subprocess,time\n"
+                "import json,os,shlex,shutil,subprocess,time\n"
                 "from pathlib import Path\n" + GROUP_HELPERS +
+                # Check tools before anything starts: a job without meta.json
+                # can be neither inspected nor stopped later.
+                "missing=[tool for tool in ('bash','ps') if not shutil.which(tool)]\n"
+                "if missing:\n"
+                "    raise SystemError('remote lacks required commands: '+', '.join(missing)+\n"
+                "        '; nothing was started (ps comes from procps)')\n"
                 f"job=Path({job_dir!r}).resolve()\n"
                 f"if job.exists() and not {args.reuse!r}:\n"
                 "    raise SystemError('job directory already exists: '+str(job))\n"
@@ -117,18 +123,24 @@ def launch(args: argparse.Namespace, session: str) -> dict:
                 "proc=subprocess.Popen(['bash','-lc',wrapper],\n"
                 "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
                 "    stderr=subprocess.DEVNULL, cwd=controller_cwd, start_new_session=True)\n"
-                "stamp=subprocess.run(['ps','-p',str(proc.pid),'-o','lstart='],\n"
-                "    text=True,capture_output=True,env={**os.environ,'LC_ALL':'C'}).stdout.strip()\n"
-                "try:\n"
-                "    pgid=os.getpgid(proc.pid)\n"
-                "except Exception:\n"
-                "    pgid=proc.pid\n"
+                # The new session makes the child its own group leader, so its
+                # pid is a safe pgid until the probes below refine the meta.
                 "meta={'job_id':"
                 f"{args.job_id!r},'command':inner,'cwd':cwd,'pid':proc.pid,"
-                "'pgid':pgid,'pid_started':stamp,'log':str(log),'rc_file':str(rc),"
+                "'pgid':proc.pid,'pid_started':'','log':str(log),'rc_file':str(rc),"
                 "'container':container,'container_id':container_id,'container_runtime':runtime,"
                 "'controller':'host' if container else 'shell','started_at':time.time()}\n"
-                "(job/'meta.json').write_text(json.dumps(meta,indent=2))\n"
+                # The job already runs: persist its handles even if a probe
+                # fails, so status and stop can still reach it.
+                "try:\n"
+                "    meta['pid_started']=subprocess.run(['ps','-p',str(proc.pid),'-o','lstart='],\n"
+                "        text=True,capture_output=True,env={**os.environ,'LC_ALL':'C'}).stdout.strip()\n"
+                "    try:\n"
+                "        meta['pgid']=os.getpgid(proc.pid)\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "finally:\n"
+                "    (job/'meta.json').write_text(json.dumps(meta,indent=2))\n"
                 "return meta",
                 timeout=args.timeout,
             )

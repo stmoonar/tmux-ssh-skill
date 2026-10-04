@@ -280,6 +280,8 @@ def _download_range(
         "sys.stdout.flush()\n"
     )
     try:
+        # Refuse a busy pane before staging, or the helper would be orphaned.
+        tmux.require_no_pipe(pane)
         # Stage the helper first so the tapped output holds only the payload.
         run_python(
             tmux,
@@ -293,8 +295,9 @@ def _download_range(
         tmux.pipe_pane_start(
             pane, f"printf ready > {shlex.quote(str(ready))} && exec cat >> {shlex.quote(str(tap))}"
         )
-        # pipe-pane -o leaves an existing pipe intact. Only a handshake from
-        # our command proves ownership, so a race cannot stop somebody's log.
+        # A pipe that raced in is toggled off by -o and ours never opens. Only
+        # a handshake from our command proves ownership, so that race ends in
+        # a refusal and we never stop a pipe we did not open.
         pipe_deadline = time.monotonic() + min(10.0, timeout)
         while not ready.exists():
             if time.monotonic() >= pipe_deadline:

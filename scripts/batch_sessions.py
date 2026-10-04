@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -74,6 +75,25 @@ def _shell_identity(tmux: Tmux, session: str, timeout: float = 10.0) -> dict:
             "shell_pid": fields["pid"], "current_command": info["current_command"]}
 
 
+def _pane_gone(tmux: Tmux, pane: str) -> str:
+    """Say why the pane no longer exists, or return '' while it still does.
+
+    When ssh or `docker exec` is the pane command, the shell exiting closes
+    the pane, its session and, with the last session, the tmux server. Pane
+    ids are never reused by one server, so each of these proves the shell is
+    gone. Any other tmux error stays an unknown outcome.
+    """
+    result = tmux.run("has-session", "-t", pane, check=False)
+    if result.returncode == 0:
+        return ""
+    error = result.stderr.strip()
+    if error.startswith("can't find"):
+        return "pane closed"
+    if error.startswith("no server running"):
+        return "tmux server exited"
+    raise TmuxError(f"cannot check pane {pane}: {error}")
+
+
 def _await_disconnect(
     tmux: Tmux,
     session: str,
@@ -89,17 +109,26 @@ def _await_disconnect(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(1.0)
-        # A missing server/socket is not evidence of remote shell exit.
-        current_pane = tmux.active_pane(session)
-        info = tmux.pane_info(current_pane)
-        if current_pane != pane:
-            raise TmuxError("active pane changed; cannot infer whether the original shell exited")
-        if info["dead"]:
-            return {"disconnected": True, "reason": "pane reported dead"}
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        after = _shell_identity(tmux, session, timeout=min(10.0, remaining))
+        gone = _pane_gone(tmux, pane)
+        if gone:
+            return {"disconnected": True, "reason": gone}
+        try:
+            current_pane = tmux.active_pane(session)
+            info = tmux.pane_info(current_pane)
+            if current_pane != pane:
+                raise TmuxError("active pane changed; cannot infer whether the original shell exited")
+            if info["dead"]:
+                return {"disconnected": True, "reason": "pane reported dead"}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            after = _shell_identity(tmux, session, timeout=min(10.0, remaining))
+        except (TmuxError, subprocess.CalledProcessError):
+            # The pane may close between the check above and the probe.
+            gone = _pane_gone(tmux, pane)
+            if gone:
+                return {"disconnected": True, "reason": gone}
+            raise
         if after["shell_pid"] and after["shell_pid"] != before["shell_pid"]:
             return {
                 "disconnected": True,
