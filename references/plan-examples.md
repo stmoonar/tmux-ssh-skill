@@ -1,34 +1,34 @@
-# 编排计划示例
+# Orchestration Plan Examples
 
-目录：计划结构 / 步骤类型 / 容器重启 / 部署与运行 / 执行语义
+Contents: plan structure / step types / container restart / deployment and execution / execution semantics
 
-## 计划结构
+## Plan structure
 
 ```json
 {
   "sessions": ["n1", "n2", "n3"],
   "steps": [
-    {"name": "步骤名", "command": "远程命令", "expect": "marker"}
+    {"name": "step-name", "command": "remote-command", "expect": "marker"}
   ]
 }
 ```
 
-`--sessions` 可在命令行覆盖计划里的会话列表。每个步骤在所有会话上并行执行，**全部会话完成当前步骤后才进入下一步**。这个屏障是批量操作能安全推进的前提。
+`--sessions` overrides the session list in the plan. Each step runs in parallel across all sessions. **Every session must finish the current step before the next step begins.** This barrier allows batch operations to advance safely.
 
-## 步骤类型
+## Step types
 
-| `expect` | 用途 | 必需字段 | 判定方式 |
+| `expect` | Purpose | Required fields | Success condition |
 |---|---|---|---|
-| `marker` | 普通命令 | `command` | `rc` 落在 `allow_rc`（默认 `[0]`）内 |
-| `disconnect` | 预期 shell 消失 | 可选 `command` | 检测到 shell 身份变化或 pane 消失 |
-| `ready` | 等待恢复可用 | `ready_command` | 反复探测直到返回 0 |
-| `json` | 结构化检查 | `python` | Python 体正常返回 |
+| `marker` | Ordinary command | `command` | `rc` is in `allow_rc` (default `[0]`) |
+| `disconnect` | Expected shell disappearance | Optional `command` | Shell identity changes or the pane disappears |
+| `ready` | Wait for availability | `ready_command` | Repeated probes return 0 |
+| `json` | Structured check | `python` | The Python function body returns normally |
 
-可选字段：`timeout_seconds`、`allow_rc`、`settle_seconds`（`ready` 步骤发送命令后的静置时间）、`poll_seconds`（探测间隔）。
+Optional fields: `timeout_seconds`, `allow_rc`, `settle_seconds` (delay after sending a `ready` step's command), and `poll_seconds` (probe interval).
 
-## 容器重启
+## Container restart
 
-这是本 skill 最典型的用途：多台机器同时退出容器、重启、再重新进入。
+A typical use of this skill is to exit, restart, and reenter containers across multiple machines.
 
 ```json
 {
@@ -63,17 +63,17 @@
 }
 ```
 
-三个关键点：
+Three key points:
 
-- 退出容器用 `disconnect`。shell 本来就要消失，用 `marker` 等回执必然超时。
-- 重启命令在宿主机执行，此时 pane 已回到宿主机 shell，所以用 `marker`。
-- 重进用 `ready`。容器内服务未必立刻就绪，反复探测比固定 `sleep` 可靠。
+- Use `disconnect` to exit the container. The shell is expected to disappear, so waiting for a `marker` receipt would time out.
+- Run the restart command on the host. The pane has returned to the host shell, so use `marker`.
+- Use `ready` for reentry. Container services may take time to become available; repeated probes are more reliable than a fixed `sleep`.
 
-`disconnect` 的检测方式是让 shell 报告自己的 PID 并比对变化。tmux 只跟踪最外层 pane 进程，嵌套 shell 或容器 shell 退出时 `pane_pid` 不变，因此必须问 shell 本身。
+`disconnect` asks the shell to report its own PID and checks for a change. tmux tracks only the outermost pane process; exiting a nested or container shell does not change `pane_pid`, so the shell itself must be queried.
 
-身份探测必须收到有效回执；超时不会判成断开成功。`ready_command` 只有在收到非零退出码后才会重试；回执超时就返回 `TIMEOUT`，并阻止后续写入，直到检查现场并显式恢复会话。
+Identity probes must receive valid receipts. A timeout is not treated as a successful disconnect. `ready_command` is retried only after a nonzero exit code is received. A receipt timeout returns `TIMEOUT` and blocks further writes until the pane is inspected and the session is explicitly recovered.
 
-## 部署与运行
+## Deployment and execution
 
 ```json
 {
@@ -92,14 +92,14 @@
 }
 ```
 
-归档本身用 `transfer.py put` 事先送到各台机器，计划只负责解包与验证。
+Upload the archive to each machine with `transfer.py put` beforehand. The plan handles only unpacking and verification.
 
-## 执行语义
+## Execution semantics
 
-**先干跑。** `--dry-run` 只打印将要执行的步骤，不接触任何会话。改动过计划就先干跑一次。
+**Dry-run first.** `--dry-run` prints the planned steps without touching any session. Run it after changing a plan.
 
-**失败即止。** 默认某会话某步骤失败就停止整个计划，避免在不一致状态上继续。加 `--continue-on-failure` 会剔除失败会话、让其余会话继续，适合允许部分机器掉队的场景。
+**Stop on failure.** By default, a failed step in any session stops the entire plan to avoid advancing with inconsistent state. `--continue-on-failure` removes failed sessions and lets the remaining sessions continue; use it when some machines may be left behind.
 
-**返回结构。** 输出按步骤分组，每组含状态、失败会话列表和每会话明细，可直接判断是哪台机器的哪一步出了问题。
+**Result structure.** Output is grouped by step. Each group includes its status, failed session names, and per-session details, making it possible to identify the failing machine and step directly.
 
-**破坏性命令。** 计划里的命令会真实执行。涉及 `rm -rf`、重启、停服务时，先确认路径与目标，并优先跑一次 `--dry-run` 复核。
+**Destructive commands.** Commands in a plan execute for real. For `rm -rf`, restarts, or service stops, confirm paths and targets and review a `--dry-run` first.

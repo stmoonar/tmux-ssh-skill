@@ -1,73 +1,73 @@
-# Base64 分块传输协议
+# Base64 Chunked Transfer Protocol
 
-目录：协议为何如此设计 / 上传时序 / 下载时序 / 参数与性能 / 失败语义
+Contents: design constraints / upload sequence / download sequence / parameters and performance / failure semantics
 
-## 协议为何如此设计
+## Design constraints
 
-传输只能走 tmux 会话里那个已经鉴权的 shell，因此不能用 `scp`、`rsync` 或任何需要再次登录的通道。数据必须以文本形式穿过 PTY，于是有几个硬约束决定了协议形态：
+Transfers must use the authenticated shell already present in a tmux session. They cannot use `scp`, `rsync`, or another channel that requires a new login. Data therefore travels as text through a PTY (pseudoterminal), subject to these constraints:
 
-- PTY 规范模式下单行输入上限约 4 KiB，所以载荷必须折行，且控制命令本身也要控制长度。
-- `capture-pane` 只能看到有限的回滚缓冲，大文件必然滚出窗口，所以下载不能依赖它。
-- PTY 会回显输入，慢速链路下回显与粘贴可能竞争，所以必须先握手再送数据。
-- 终端可能插入 `\r` 和转义序列，所以解析必须只接受严格合法的 base64 行。
+- Canonical PTY input has a line limit of about 4 KiB. Wrap payload lines and keep control commands short.
+- `capture-pane` exposes only limited scrollback. Large files would scroll out of view, so downloads cannot rely on it.
+- PTYs echo input. On slow links, echo and paste can compete; complete a handshake before sending data.
+- Terminals may insert `\r` and escape sequences. Accept only strictly valid Base64 lines when parsing.
 
-## 上传时序
+## Upload sequence
 
-每个分块独立完成一次完整往返：
+Each chunk completes a full independent round trip:
 
-1. 本地读取一个分块，base64 编码，折成 76 列，末尾追加唯一结束标记。
-2. `load-buffer` 把它装进 tmux 缓冲区。
-3. 向远端发送读取循环：先 `stty -echo` 关闭回显，打印 `READY` 标记，然后逐行读到结束标记为止。
-4. 本地**等到看见 `READY` 才** `paste-buffer`。这一步是关键：先粘贴会丢开头数据。
-5. 远端解码并追加到暂存文件，恢复 `stty echo`，打印带 `rc` 的回执。
+1. Read a local chunk, Base64-encode it, wrap it at 76 columns, and append a unique end marker.
+2. Load it into a tmux buffer with `load-buffer`.
+3. Send a remote read loop that disables echo with `stty -echo`, prints a `READY` marker, and reads lines until the end marker.
+4. Call `paste-buffer` locally **only after observing `READY`**. Pasting earlier can lose the start of the payload.
+5. Decode remotely, append to the staging file, restore `stty echo`, and print a receipt containing `rc`.
 
-所有分块传完后，远端一次性校验：
+After all chunks arrive, perform final verification remotely:
 
-1. 比对线上载荷的 SHA256 与字节数。传了压缩就先解压。
-2. 比对解压后原始内容的 SHA256 与字节数。
-3. 两项都过才 `replace` 到正式路径。
+1. Compare the wire payload's SHA256 and byte count. Decompress if compression was used.
+2. Compare the original content's SHA256 and byte count after decompression.
+3. Use `replace` to publish the final path only after both checks pass.
 
-因此正式路径下的文件要么不存在，要么内容必定正确。
+The transfer therefore publishes only a verified complete file at the final path.
 
-## 下载时序
+## Download sequence
 
-1. 先检查已有输出管道；存在时拒绝下载并保留原日志。通过 `pipe-pane -o` 和本地握手取得自己的管道后，才触发远端输出。
-2. 远端按字节范围切片，用 Python 计算该片 SHA256，输出起始标记、base64 载荷、结束标记。
-3. 本地从抽取文件中解析，只接受长度合法、字符集合法的 base64 行。
-4. 每片单独校验后追加到本地暂存文件。
-5. 全部分片就位后，比对整文件 SHA256 与字节数，再改名到目标路径。
+1. Check for an existing output pipe. If one exists, refuse the download and preserve the existing log. Acquire a dedicated pipe with `pipe-pane -o` and a local handshake before triggering remote output.
+2. Slice the remote file by byte range, compute the range's SHA256 in Python, and emit a start marker, Base64 payload, and end marker.
+3. Parse the local capture file, accepting only Base64 lines with valid lengths and characters.
+4. Verify each range independently before appending it to a local staging file.
+5. After all ranges arrive, verify the whole-file SHA256 and byte count, then rename to the destination path.
 
-切片、哈希、编码全部在远端 Python 内完成，不用 `dd`、`stat -c`、`sha256sum`，因为这些工具在 BSD 与 GNU 环境下参数不兼容。
+Slicing, hashing, and encoding all run in remote Python. Avoid `dd`, `stat -c`, and `sha256sum` because their options differ between BSD and GNU environments.
 
-## 参数与性能
+## Parameters and performance
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `--chunk-bytes` | 3 MiB | 每个分块的原始字节数 |
-| `--compress` | 关 | 上传前 gzip，远端自动解压还原 |
-| `--timeout` | 600 s | 单次远程等待上限 |
-| `--max-parallel` | 4 | 同时处理的会话数 |
+| `--chunk-bytes` | 3 MiB | Raw bytes per chunk |
+| `--compress` | Off | gzip before upload; automatic remote decompression |
+| `--timeout` | 600 s | Maximum wait for an individual remote operation |
+| `--max-parallel` | 4 | Sessions handled concurrently |
 
-base64 本身有约 33% 膨胀，加上 PTY 逐行处理，吞吐远低于原生文件通道。据此选择策略：
+Base64 adds about 33% overhead, and PTY line-by-line processing reduces throughput compared with native file channels. Choose accordingly:
 
-- 目录和大量小文件先打包成单个归档，一次传输远快于多次往返。
-- 文本类内容开压缩，通常能把实际上线字节降到几分之一。
-- 已压缩的归档、图片、权重文件不要再压。
-- 每次结果都带 `throughput_mib_s` 和 `elapsed_seconds`，调参以实测为准。
-- 会话之间并行，同一会话内串行，因为一条 PTY 无法安全交错。
+- Package directories and many small files into a single archive to reduce round trips.
+- Compress text content to reduce the bytes sent over the channel.
+- Do not recompress already compressed archives, images, or model weights.
+- Each result includes `throughput_mib_s` and `elapsed_seconds`; tune using measurements.
+- Run different sessions in parallel and operations within a session sequentially. One PTY cannot safely carry interleaved operations.
 
-## 失败语义
+## Failure semantics
 
-| 现象 | 含义 | 应对 |
+| Symptom | Meaning | Action |
 |---|---|---|
-| `remote reader not ready` | 远端没能进入读取循环 | 检查 shell 是否卡在交互程序或已退出 |
-| 分块 `rc` 非 0 | 远端解码失败 | 协议会自动送出结束标记并恢复回显，之后重传该文件 |
-| `wire mismatch` | 上线字节与本地不符 | 链路损坏，暂存文件已删，重传 |
-| `payload mismatch` | 解压后内容不符 | 暂存文件已删，正式路径未被触碰 |
-| `range verification failed` | 某个下载分片损坏 | 本地暂存已清理，重新下载 |
-| `pane already has an output pipe` | 当前 pane 正在记录终端日志 | 保留原管道，换用没有输出管道的 pane |
-| `TIMEOUT` | 回执未出现，操作可能仍在进行 | 先查远端实际状态，确认后再决定，不要立即重试 |
+| `remote reader not ready` | The remote shell did not enter its read loop | Check for an interactive program or an exited shell |
+| Nonzero chunk `rc` | Remote decoding failed | The protocol sends the end marker and restores echo automatically; then retransmit the file |
+| `wire mismatch` | Wire bytes differ from the local source | The link is corrupted; the staging file is deleted; retransmit |
+| `payload mismatch` | Decompressed content differs | The staging file is deleted and the final path remains untouched |
+| `range verification failed` | A download range is corrupted | Local staging is cleaned up; download again |
+| `pane already has an output pipe` | The pane is already logging terminal output | Preserve the pipe and use a pane without an output pipe |
+| `TIMEOUT` | No receipt appeared; the operation may still be running | Inspect actual remote state before deciding what to do; do not retry immediately |
 
-任何失败路径都不会在正式路径留下半成品：上传经 `.part-<nonce>` 后原子改名，下载经本地 `.part-` 暂存后改名。
+Failures never publish a partial file at the final path. Uploads use `.part-<nonce>` staging followed by an atomic rename; downloads stage locally in `.part-` files before renaming.
 
-超时或驱动被终止后，后续写入会被会话的未完成标记阻止。先只读 `capture-pane` 并确认 shell 空闲，再按 `SKILL.md` 的 `--recover-session` 流程恢复。下载临时文件和句柄在成功及异常路径中都会释放。
+After a timeout or terminated driver, the session's unfinished-operation marker blocks further writes. Inspect with read-only `capture-pane`, confirm the shell is idle, and follow the `--recover-session` procedure in `SKILL.md`. Download temporary files and handles are released on both success and exception paths.

@@ -1,77 +1,77 @@
-# 故障排查
+# Troubleshooting
 
-目录：会话与通道 / 执行回执 / 传输 / 远程任务 / 断开与重进 / 排查顺序
+Contents: sessions and channels / execution receipts / transfers / remote jobs / disconnect and reentry / investigation order
 
-## 会话与通道
+## Sessions and channels
 
-| 现象 | 原因 | 处理 |
+| Symptom | Cause | Action |
 |---|---|---|
-| `session not found on socket` | 会话名错或 socket 不对 | 用 `tmux -S SOCK list-sessions` 核对实际名称 |
-| `session has no panes` | 会话残留但窗格已销毁 | 需要人工在该会话重建可用 shell |
-| 锁等待超时 | 同一会话另有驱动在跑 | 查清是谁在用；不要绕过锁并行操作同一 PTY |
-| `unfinished or timed-out operation` | 上一次操作超时或驱动被终止 | 先只读查看 pane，确认 shell 空闲，再用 `tmux_exec.py --recover-session` 恢复 |
-| 命令送错环境 | pane 当前不在预期 shell 层级 | 先跑 `session_preflight.py` 用 `--expect-cwd-prefix` 核对 |
+| `session not found on socket` | Wrong session name or socket | Check actual names with `tmux -S SOCK list-sessions` |
+| `session has no panes` | The session remains but its panes are gone | Manually recreate a usable shell in that session |
+| Lock wait timeout | Another driver is using the same session | Identify the owner; do not bypass the lock to operate on the same PTY concurrently |
+| `unfinished or timed-out operation` | The previous operation timed out or its driver was terminated | Inspect the pane read-only, confirm the shell is idle, then recover with `tmux_exec.py --recover-session` |
+| Command reaches the wrong environment | The pane is at an unexpected shell level | Run `session_preflight.py` with `--expect-cwd-prefix` first |
 
-## 执行回执
+## Execution receipts
 
-**回执迟迟不出现。** 常见于 pane 停在交互式程序（分页器、编辑器、密码提示）里。此时命令被当作那个程序的输入，永远不会产生回执。先看一眼 pane 当前画面，退出交互程序再操作。
+**No receipt appears.** The pane may be inside an interactive program such as a pager, editor, or password prompt. The command becomes input to that program and never produces a receipt. Inspect the pane and exit the interactive program before continuing.
 
-**超时的正确理解。** `TIMEOUT` 表示回执尚未可见，不代表命令失败。命令可能仍在运行。正确动作是查远端实际状态（进程、文件、日志），**不是**重新发送——重发可能造成重复执行。
+**Interpreting timeouts.** `TIMEOUT` means the receipt is not visible yet, not that the command failed. The command may still be running. Inspect remote processes, files, and logs before considering a retry; resending can duplicate execution.
 
-**为什么回执要独占一行。** PTY 会回显发送的命令，而命令文本里含有 marker 字面量。协议要求真实回执从行首开始，且内容必须是合法 JSON 或已展开的 `key=value`，以此区分回显与结果。这也是不要在自定义命令里手工打印 skill marker 的原因。
+**Why receipts occupy their own line.** A PTY echoes sent commands, including literal markers in command text. The protocol requires real receipts to begin at the start of a line and contain valid JSON or expanded `key=value` fields. This distinguishes echoed input from actual results. Do not manually print skill markers in custom commands.
 
-**远程 Python 报错。** 异常会带完整 traceback 回传。`--python-file` 的内容是函数体，必须以 `return` 结束，返回值必须可 JSON 序列化；返回 `set`、文件对象一类会失败。
+**Remote Python errors.** Exceptions return a full traceback. `--python-file` must contain a function body ending with `return`, and the return value must be JSON-serializable. Returning a `set` or file object fails.
 
-## 传输
+## Transfers
 
-**上传卡在 `remote reader not ready`。** 远端没进入读取循环。通常是 shell 已退出、卡在交互程序，或 `stty` 不可用。
+**Upload stops at `remote reader not ready`.** The remote shell did not enter its read loop. It may have exited, be stuck in an interactive program, or lack `stty`.
 
-**下载解析不到数据。** 抽取到的内容里没有合法起始标记。多见于 pane 有持续后台输出干扰。先让 pane 安静下来再传。
+**Download parsing finds no data.** The captured output has no valid start marker, often because continuous background output is interfering. Quiet the pane before transferring.
 
-**已有输出管道。** 下载拒绝替换已有的 `pipe-pane` 日志。换用没有输出管道的 pane；不要直接停掉未知来源的日志设置。
+**An output pipe already exists.** Downloads refuse to replace an existing `pipe-pane` log. Use a pane without an output pipe; do not disable logging of unknown origin.
 
-**校验失败。** `wire mismatch` 是链路损坏，`payload mismatch` 是解压后不符，两者都会清理暂存文件且不触碰正式路径，直接重传即可。
+**Verification fails.** `wire mismatch` indicates corrupted wire data; `payload mismatch` indicates incorrect decompressed content. Both clean up staging files and leave the final path untouched, so retransmit the file.
 
-**速度不理想。** base64 有约 33% 膨胀，PTY 逐行处理也慢。先看返回里的 `throughput_mib_s`，再考虑：文本内容加 `--compress`、目录先打包、调整 `--chunk-bytes`、多会话并行。不要指望它达到原生文件通道的速度。
+**Poor throughput.** Base64 adds about 33% overhead, and PTY line-by-line processing is slow. Check `throughput_mib_s`, then consider `--compress` for text, packaging directories, adjusting `--chunk-bytes`, or parallel transfers across sessions. Do not expect native file-channel throughput.
 
-**容器内路径取不到。** 如果目标路径只在某个嵌套环境内可见，先用命令把文件挪到当前 shell 能直接访问的位置，再传输。
+**A container path is inaccessible.** If a path is visible only inside a nested environment, first move the file to a location directly accessible to the current shell, then transfer it.
 
-## 远程任务
+## Remote jobs
 
-| 状态 | 含义 | 处理 |
+| State | Meaning | Action |
 |---|---|---|
-| `RUNNING` | 进程组内仍有运行的进程 | 继续轮询 |
-| `SUCCEEDED` | 退出码为 0 | 可以收包 |
-| `FAILED` | 退出码非 0 | 看 `tail` 与完整日志 |
-| `LOST` | 进程不在但没有退出码 | 被外部杀掉或机器重启，查日志而非直接重跑 |
-| `MISSING` | 任务目录不存在 | `job-root` 或 `job-id` 写错，或目录被清理 |
+| `RUNNING` | The process group still contains running processes | Continue polling |
+| `SUCCEEDED` | Exit code is 0 | Collect results |
+| `FAILED` | Exit code is nonzero | Inspect `tail` and full logs |
+| `LOST` | The process is gone but no exit code exists | It may have been killed externally or the machine restarted; inspect logs before rerunning |
+| `MISSING` | The job directory does not exist | Check `job-root` and `job-id`, or whether the directory was cleaned up |
 
-**任务重名。** `launch` 拒绝已存在的任务目录，防止覆盖历史证据。确实要复用时显式加 `--reuse`。
+**Duplicate job names.** `launch` rejects an existing job directory to preserve historical evidence. Add `--reuse` explicitly only when reuse is intended.
 
-**停止不生效。** `stop` 先向进程组发 `TERM`，宽限期后发 `KILL`。若仍报 `still_alive`，通常是进程处于不可中断状态或权限不足，需要人工介入。
+**Stopping has no effect.** `stop` sends `TERM` to the process group, then `KILL` after a grace period. A remaining `still_alive` result usually indicates an uninterruptible process or insufficient permissions and requires manual intervention.
 
-**容器任务。** 新任务从宿主机 shell 启动；状态目录在宿主机，命令经运行时 `exec` 在容器内执行。后续操作仍从宿主机调用。旧任务如果只记录了容器名，脚本会拒绝自动停止，需在宿主机核对实际容器与进程。
+**Container jobs.** Jobs launched with `--container` start from the host shell. Their state directory lives on the host, while commands execute inside the container through the runtime's `exec`. Invoke subsequent operations from the host too. Older jobs recording only a container name cannot be stopped automatically; verify the actual container and processes on the host. For a pane already inside a container, use ordinary shell jobs without `--container`, as described in `SKILL.md`.
 
-**退出码为什么可靠。** 启动时用包装脚本把真实退出码写进 `rc` 文件，因此本地断开、重连后依然能读到准确结果，不依赖任何本地进程存活。
+**Why exit codes remain reliable.** A launch wrapper writes the actual exit code to an `rc` file. After a local disconnect or reconnect, the result remains readable without relying on a local process staying alive.
 
-**永远不要杀会话。** `stop` 只作用于远程进程组或容器。tmux 会话必须保留，否则丢失现场、也无法重新进入排查。
+**Never kill the session.** `stop` affects only the remote process group or container. Preserve tmux sessions so the environment remains available for investigation and reentry.
 
-## 断开与重进
+## Disconnect and reentry
 
-**该用 `disconnect` 却用了 `marker`。** 退出容器、重启 SSH 这类操作会让 shell 消失，等回执必然超时。这类步骤要声明 `expect: disconnect`。
+**Using `marker` where `disconnect` is required.** Exiting a container or restarting SSH can make the shell disappear, so waiting for a receipt times out. Declare these steps with `expect: disconnect`.
 
-**判定为「shell 仍存活」。** 说明 shell 身份没变化。确认命令是否真的会让 shell 退出；`docker restart` 在宿主机执行时并不会杀掉宿主机 shell。
+**The shell is reported as still alive.** Its identity has not changed. Confirm that the command actually exits the shell; `docker restart` on the host does not kill the host shell.
 
-**探测没有回答。** 结果是 `TIMEOUT`，不会当成断开成功，也不会自动重发探测。先查看 pane；切换活动 pane 也不能证明原 shell 已退出。
+**A probe receives no answer.** The result is `TIMEOUT`, not a successful disconnect. The probe is not resent automatically. Inspect the pane first; changing the active pane does not prove the original shell exited.
 
-**重进后立刻失败。** 容器起来了但内部服务未就绪。把 `ready_command` 换成真正代表可用的检查（关键目录、进程、端口），并给足 `timeout_seconds`。
+**Failure immediately after reentry.** The container is running but its services are not ready. Set `ready_command` to a check that represents actual availability, such as a required directory, process, or port, and allow enough `timeout_seconds`.
 
-## 排查顺序
+## Investigation order
 
-遇到问题按此顺序，通常前两步就能定位：
+Follow this sequence; the first two steps often locate the problem:
 
-1. `tmux -S SOCK list-sessions` 确认会话在。
-2. `session_preflight.py` 确认 shell 位置、用户、目录符合预期。
-3. 用 `tmux_exec.py` 跑一条最简单的命令（如 `echo ok`）确认通道通畅。
-4. 再针对具体环节（传输、任务、编排）复现问题。
-5. 全程留意区分「回执没到」与「操作失败」，两者的处理完全不同。
+1. Confirm the session exists with `tmux -S SOCK list-sessions`.
+2. Use `session_preflight.py` to confirm the shell environment, user, and directory match expectations.
+3. Run a minimal command such as `echo ok` with `tmux_exec.py` to check the channel.
+4. Investigate the specific failing operation: transfer, job management, or orchestration.
+5. Keep distinguishing a missing receipt from a failed operation; they require different responses.

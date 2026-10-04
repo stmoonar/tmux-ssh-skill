@@ -1,155 +1,158 @@
-# tmux SSH Workflow Skill · 复用已建立 tmux 通道的远程工作流
+# tmux SSH Workflow Skill
+
+English | [简体中文](./README.zh-CN.md)
 
 ![GitHub stars](https://img.shields.io/github/stars/stmoonar/tmux-ssh-skill?style=flat-square)
 ![Skill](https://img.shields.io/badge/Skill-Agent-111111?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square)
 ![tmux](https://img.shields.io/badge/tmux-supported-1f425f?style=flat-square)
 
-一个面向 Claude Code、Codex 及其他本地 Agent 的 tmux 远程工作流 Skill。
+A tmux remote workflow skill for Claude Code, Codex, and other local agents.
 
-它不负责新建 SSH 连接，而是复用本机 tmux 中已经建立并完成鉴权的 SSH 或容器 shell，在远程环境中可靠地执行命令、传输文件、启动和监控长期任务，并支持容器重启后的重新进入与断线接管。
+It reuses authenticated SSH or container shells already established in local tmux sessions to execute remote commands, transfer files, launch and monitor long-running jobs, and resume work after container restarts or disconnections. It does not create new SSH connections.
 
 ```text
-本机 tmux socket → tmux 会话 → 已鉴权的远程 shell → 命令 / 文件 / 任务 / 容器
+Local tmux socket → tmux session → authenticated remote shell → commands / files / jobs / containers
 ```
 
-## 30 秒开始
+## Quick start
 
-### 安装
+### Installation
 
-推荐使用 `skills` 安装：
+Install with `skills`:
 
 ```bash
 npx skills add https://github.com/stmoonar/tmux-ssh-skill --skill tmux-ssh-workflow
 ```
 
-也可以手动安装到 Claude Code 的 Skill 目录：
+Or clone manually into Claude Code's skill directory:
 
 ```bash
 git clone https://github.com/stmoonar/tmux-ssh-skill.git \
   ~/.claude/skills/tmux-ssh-workflow
 ```
 
-Windows 上 Claude Code 默认跑在 PowerShell 侧，在 PowerShell 中执行（若 Claude Code 跑在 WSL 里，则在 WSL 中执行上面的命令）：
+If Claude Code runs on the Windows side, run this in PowerShell. If it runs inside WSL, use the command above in WSL:
 
 ```powershell
 git clone https://github.com/stmoonar/tmux-ssh-skill.git "$env:USERPROFILE\.claude\skills\tmux-ssh-workflow"
 ```
 
-脚本本身仍需在 WSL 中运行，见下文 [Windows（WSL）](#windowswsl)。
+The scripts themselves must still run inside WSL; see [Windows (WSL)](#windows-wsl).
 
-安装完成后，确认目录中包含：
+After installation, confirm the directory contains:
 
 ```text
 SKILL.md
 README.md
+README.zh-CN.md
 references/
 scripts/
 ```
 
-### 触发方式
+### Invoking the skill
 
-当本机已经有 tmux socket 和会话，并且需要操作会话中的远程 shell 时，可以直接告诉 Agent：
+When a local tmux socket and sessions already exist, ask the agent to operate on their remote shells:
 
 ```text
-使用 tmux socket /tmp/team.sock 的 remote-a 会话，检查远程环境并运行训练任务。
+Use session remote-a on tmux socket /tmp/team.sock to check the remote environment and run a training job.
 ```
 
 ```text
-通过 tmux 会话 node-01 把 ./bundle.zip 传到远程 /workspace/bundle.zip，传完后校验哈希。
+Upload ./bundle.zip to /workspace/bundle.zip through tmux session node-01 and verify its hash.
 ```
 
 ```text
-在 remote-a、remote-b、remote-c 三个会话上执行同一套容器重启、重进和环境检查流程，先 dry-run。
+Run the same container restart, reentry, and environment checks across remote-a, remote-b, and remote-c. Start with a dry-run.
 ```
 
-## 适合与不适合
+## When to use it
 
-### 适合
+### Suitable uses
 
-- 已经存在 tmux socket 和会话，需要复用其中的 SSH 或容器 shell。
-- 在一台或多台远程机器上执行命令，并获取结构化结果。
-- 通过现有 PTY 通道上传或下载文件，且不希望再次处理 SSH 凭据。
-- 启动可能超过本地命令超时的训练、构建、部署或数据处理任务。
-- 容器重启、SSH 重连后重新发现 pane，并继续接管远程工作流。
-- 多台机器执行有先后依赖的同一组操作。
+- Reusing SSH or container shells in existing local tmux sessions.
+- Executing commands on one or more remote machines and retrieving structured results.
+- Uploading or downloading through an existing PTY (pseudoterminal, the terminal channel used by tmux) without handling SSH credentials again.
+- Launching training, build, deployment, or data-processing jobs that may outlast a local command timeout.
+- Rediscovering the active pane (tmux terminal area) and resuming remote work after container restarts or SSH reconnects.
+- Running the same sequence of dependent operations across multiple machines.
 
-### 不适合
+### Outside its scope
 
-- 新建 SSH 连接，或管理 host、user、port、跳板机等连接配置。
-- 本机没有可用 tmux 通道的远程操作。
-- 需要原生 `scp`、`rsync` 或高吞吐文件传输的场景。
-- 仅需要管理本地 tmux 会话本身的场景。
+- Creating SSH connections or managing host, user, port, or jump-host configuration.
+- Remote operations without an available local tmux channel.
+- Transfers that require native `scp`, `rsync`, or high throughput.
+- Managing local tmux sessions alone.
 
-## 核心能力
+## Capabilities
 
-| 能力 | 脚本 | 说明 |
-|------|------|------|
-| 会话预检 | `scripts/session_preflight.py` | 检查会话、活动 pane、远端 host、用户、cwd 和必需命令 |
-| 远程执行 | `scripts/tmux_exec.py` | 在一个或多个会话中并行执行 shell 命令或 Python 结构化检查 |
-| 文件传输 | `scripts/transfer.py` | 通过 tmux PTY 上传和下载，支持压缩、分块、SHA256 和原子改名 |
-| 长任务管理 | `scripts/remote_job.py` | 启动、查看状态、停止和收集远程长期任务 |
-| 批量编排 | `scripts/batch_sessions.py` | 以阶段屏障驱动多会话流程，支持 dry-run、重连等待和结构化检查 |
+| Capability | Script | Description |
+|------------|--------|-------------|
+| Session preflight | `scripts/session_preflight.py` | Check sessions, active panes, remote host, user, working directory, and required commands |
+| Remote execution | `scripts/tmux_exec.py` | Run shell commands or structured Python checks across one or more sessions |
+| File transfer | `scripts/transfer.py` | Upload and download through tmux PTYs with compression, chunking, SHA256 verification, and atomic renames |
+| Long-running jobs | `scripts/remote_job.py` | Launch, inspect, stop, and collect remote jobs |
+| Batch orchestration | `scripts/batch_sessions.py` | Coordinate sessions with stage barriers, dry-runs, reconnect waits, and structured checks |
 
-所有脚本输出 JSON，成功返回退出码 `0`，失败返回非零退出码。多会话操作会在不同会话之间并行，同一会话内通过锁串行执行，避免同一条 PTY 的回执互相污染。
+All scripts output JSON, return exit code `0` on success, and return a nonzero code on failure. Operations run in parallel across sessions. Within a session, locks serialize operations to keep receipts from interleaving on the same PTY.
 
-## 设计原则
+## Design principles
 
-1. 每次操作都重新发现活动 pane。容器重启或 SSH 重连后，旧 pane 不能继续假定有效。
-2. 超时不等于失败。超时只表示回执尚未出现，任务可能仍在运行，禁止自动重发。
-3. 长任务状态写在远程 job 目录中，不依赖本地进程或 tmux 回滚缓冲，因此断线后仍可接管。
-4. 停止操作只针对远程任务或容器，绝不执行 `kill-session`、`kill-window` 或 `kill-pane`。
-5. 批量操作按阶段设置屏障，当前步骤的所有会话完成后才进入下一步。
-6. 正式文件路径只在完整校验通过后更新，失败时不留下可用但内容错误的半成品。
+1. Rediscover the active pane on every operation. A previously discovered pane may be invalid after a container restart or SSH reconnect.
+2. A timeout does not mean failure. It means no receipt has appeared yet; the operation may still be running. Never resend automatically.
+3. Long-running job state lives in remote job directories, independent of local processes and tmux scrollback, so work can be resumed after a disconnect.
+4. Stop only remote jobs or containers. Never execute `kill-session`, `kill-window`, or `kill-pane`.
+5. Batch operations use stage barriers: all sessions finish the current step before the next begins.
+6. Final file paths are updated only after complete verification. A failed transfer never publishes a partial or corrupted file.
 
-## 标准工作流
+## Standard workflow
 
-推荐按以下顺序执行：
+Follow this sequence:
 
-1. 使用 `session_preflight.py` 确认会话可用、远端 shell 层级正确、cwd 和命令满足预期。
-2. 使用 `transfer.py put` 上传代码、配置或输入数据。
-3. 使用 `tmux_exec.py` 执行解包、依赖检查和环境准备。
-4. 使用 `remote_job.py launch` 启动长期任务，保存返回的 `pid` 和 `pgid`。
-5. 使用 `remote_job.py status` 轮询任务状态，直到 `SUCCEEDED` 或 `FAILED`。
-6. 使用 `remote_job.py collect` 在远端打包结果，再用 `transfer.py get` 下载并校验。
-7. 需要中止时使用 `remote_job.py stop`，不要直接杀 tmux 会话。
+1. Use `session_preflight.py` to confirm the session is available, the remote shell is in the expected environment, and the working directory and commands meet requirements.
+2. Upload code, configuration, or input data with `transfer.py put`.
+3. Use `tmux_exec.py` to unpack files, check dependencies, and prepare the environment.
+4. Launch a long-running job with `remote_job.py launch` and save its `pid` and `pgid` (process and process-group IDs).
+5. Poll with `remote_job.py status` until the job reaches `SUCCEEDED` or `FAILED`.
+6. Package results remotely with `remote_job.py collect`, then download and verify them with `transfer.py get`.
+7. Stop a job with `remote_job.py stop` when needed; preserve the tmux session.
 
-## 环境要求
+## Requirements
 
-### 本地
+### Local machine
 
-- Python `3.10+`。
-- 已安装 `tmux`，并且目标 socket 可访问。
-- 至少存在一个已经建立并完成鉴权的 SSH 或容器 shell。
-- 不需要额外的 Python 第三方依赖，脚本使用标准库。
+- Python `3.10+`.
+- tmux installed and access to the target socket.
+- At least one established, authenticated SSH or container shell.
+- No third-party Python dependencies; scripts use the standard library.
 
-### 远端
+### Remote environment
 
-- 可被当前 pane 使用的类 Unix shell，脚本默认通过 `bash` 执行命令。
-- Python `3.8+` 的 `python3`，用于结构化检查、任务状态和文件分片处理；长期任务管理还需 `ps`。
-- `base64`、`stty` 等基础命令，用于 PTY 文件传输协议。
-- 如果使用容器流程，需要对应的容器运行时命令和权限。
+- A Unix-like shell accessible through the current pane. Commands run through `bash` by default.
+- Python `3.8+` available as `python3` for structured checks, job state, and file ranges. Long-running job management also requires `ps`.
+- Basic commands such as `base64` and `stty` for the PTY transfer protocol.
+- The appropriate container runtime commands and permissions for container workflows.
 
-### Windows（WSL）
+### Windows (WSL)
 
-只支持在 WSL 中运行，tmux socket 和 SSH 会话都要建在 WSL 里；原生 Windows Python 运行脚本会直接退出并提示 `wsl` 命令。
+Run only inside WSL (Windows Subsystem for Linux). The tmux socket and SSH sessions must also live in WSL. Native Windows Python exits immediately with a suggested `wsl` command.
 
-- Agent 跑在 Windows 侧时，从 PowerShell 调用 `wsl -d <发行版> -e python3 "/mnt/c/<skill 路径>/scripts/X.py" ...`；发行版和用户必须与创建 tmux 的环境一致，必要时加 `-u <用户>`。在 Git Bash 中调用时需加 `MSYS_NO_PATHCONV=1`，否则 POSIX 参数会被改写成 `C:/...`，脚本会报错拒绝。
-- Claude Code 跑在 WSL 里时，与 Linux 完全相同。
-- 本地文件参数可以写 `C:\...`，会自动转成 `/mnt/c/...`；`--socket` 和远程路径必须是 POSIX 路径。
-- PowerShell 不展开 `scripts/*.py`、`$((...))` 等 bash 语法，含这些写法的示例请放进 `wsl -e bash -lc '...'` 执行。
-- 长传输注意 Agent 工具的默认超时与中断后的检查方式，见 [`SKILL.md`](./SKILL.md) 的 Windows 一节。
+- For an agent running on Windows, invoke from PowerShell with `wsl -d <distribution> -e python3 "/mnt/c/<skill-path>/scripts/X.py" ...`. Use the distribution and user that created tmux; add `-u <user>` if needed. With Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`; otherwise POSIX arguments may be rewritten as `C:/...` and rejected.
+- Claude Code running inside WSL uses the same commands as Linux.
+- Local file arguments accept `C:\...` and automatically convert it to `/mnt/c/...`. `--socket` and remote paths must use POSIX syntax.
+- PowerShell does not expand Bash syntax such as `scripts/*.py` or `$((...))`. Run examples using that syntax through `wsl -e bash -lc '...'`.
+- Allow enough time for large transfers and inspect the session after interrupted calls. See the Windows section in [`SKILL.md`](./SKILL.md).
 
-## 脚本用法
+## Script usage
 
-以下示例假定：
+The examples below assume:
 
 ```bash
 SOCKET=/tmp/team.sock
 SESSIONS=remote-a,remote-b
 ```
 
-### 1. 会话预检
+### 1. Session preflight
 
 ```bash
 python3 scripts/session_preflight.py \
@@ -159,11 +162,13 @@ python3 scripts/session_preflight.py \
   --require-command python3
 ```
 
-可以额外使用 `--expect-host-contains` 检查远端主机标识。会话本应停在容器内（例如常驻 `docker exec -it <ctr> bash`）时加 `--expect-in-container`：容器重启后 pane 会掉回宿主机 shell，预检据此失败，避免后续命令落到宿主机上；反之用 `--expect-host` 确认不在容器里。检测依据是 `/.dockerenv`、`/run/.containerenv` 或 PID 1 的 cgroup，其他运行时可用 `--container-marker PATH` 补充标记文件。结果中的 `in_container` 和 `container_hints` 给出判断依据。预检只有在所有会话都通过时才返回成功。
+Add `--expect-host-contains` to check the remote hostname. If the session should already be inside a container, such as a persistent `docker exec -it <ctr> bash`, add `--expect-in-container`. After a container restart, a pane may fall back to the host shell; this check rejects that state before later commands reach the host. Use `--expect-host` to require a shell outside a container instead.
 
-### 2. 执行远程命令
+Detection uses `/.dockerenv`, `/run/.containerenv`, or PID 1's cgroup. Add `--container-marker PATH` for other runtime marker files. Results include `in_container` and `container_hints` to explain the decision. Preflight succeeds only when every session passes.
 
-在多个会话上并行执行普通命令：
+### 2. Execute remote commands
+
+Run an ordinary command across sessions in parallel:
 
 ```bash
 python3 scripts/tmux_exec.py \
@@ -173,7 +178,7 @@ python3 scripts/tmux_exec.py \
   --show-output
 ```
 
-需要结构化结果时，把 Python 函数体写入文件。函数体必须以 `return` 结束，返回值必须可以 JSON 序列化：
+For structured results, write a Python function body into a file. It must end with `return`, and its return value must be JSON-serializable:
 
 ```python
 import os
@@ -191,11 +196,11 @@ python3 scripts/tmux_exec.py \
   --python-file check_env.py
 ```
 
-`--command` 和 `--python-file` 必须二选一。使用 `--show-output` 时，脚本会读取并返回远端输出尾部，避免把大量日志全部塞入回执。
+Choose exactly one of `--command` or `--python-file`. With `--show-output`, the script returns the tail of remote output rather than putting entire logs into the receipt.
 
-### 3. 上传和下载文件
+### 3. Upload and download files
 
-上传单个文件：
+Upload a single file:
 
 ```bash
 python3 scripts/transfer.py put \
@@ -205,7 +210,7 @@ python3 scripts/transfer.py put \
   --remote-path /workspace/bundle.zip
 ```
 
-源码、日志和 JSON 等文本内容通常适合压缩传输：
+Source code, logs, JSON, and other text content usually benefit from compression:
 
 ```bash
 python3 scripts/transfer.py put \
@@ -216,7 +221,7 @@ python3 scripts/transfer.py put \
   --compress
 ```
 
-下载结果：
+Download results:
 
 ```bash
 python3 scripts/transfer.py get \
@@ -226,9 +231,9 @@ python3 scripts/transfer.py get \
   --dest ./returns/result.tar.gz
 ```
 
-如果多个会话同时下载到同一个目标路径，脚本会自动按会话名生成前缀，避免覆盖。覆盖已有文件必须显式添加 `--overwrite`。
+When multiple sessions download to the same destination, local filenames are prefixed with session names to avoid collisions. Overwriting an existing file requires explicit `--overwrite`.
 
-目录建议先在本地打包成一个归档，再通过 `transfer.py` 传输：
+Package directories locally into a single archive before transferring:
 
 ```bash
 tar -czf bundle.tar.gz project/
@@ -239,9 +244,9 @@ python3 scripts/transfer.py put \
   --remote-path /workspace/bundle.tar.gz
 ```
 
-### 4. 启动和管理长期任务
+### 4. Launch and manage long-running jobs
 
-启动任务：
+Launch a job:
 
 ```bash
 python3 scripts/remote_job.py launch \
@@ -253,7 +258,7 @@ python3 scripts/remote_job.py launch \
   --command './train.sh'
 ```
 
-查询状态和日志尾部：
+Inspect status and log tails:
 
 ```bash
 python3 scripts/remote_job.py status \
@@ -263,7 +268,7 @@ python3 scripts/remote_job.py status \
   --job-root /workspace/job-state
 ```
 
-停止远程任务：
+Stop the remote job:
 
 ```bash
 python3 scripts/remote_job.py stop \
@@ -273,7 +278,7 @@ python3 scripts/remote_job.py stop \
   --job-root /workspace/job-state
 ```
 
-收集任务目录：
+Collect the job directory:
 
 ```bash
 python3 scripts/remote_job.py collect \
@@ -283,23 +288,23 @@ python3 scripts/remote_job.py collect \
   --job-root /workspace/job-state
 ```
 
-`collect` 会在远端生成任务归档并返回归档路径、字节数和 SHA256。拿到归档路径后，再使用 `transfer.py get` 下载。
+`collect` creates a remote job archive and returns its path, byte count, and SHA256. Download that path with `transfer.py get`.
 
-任务状态包括：
+Job states:
 
-| 状态 | 含义 |
-|------|------|
-| `RUNNING` | 进程组内仍有运行的进程，即使主进程已写入退出码 |
-| `SUCCEEDED` | 任务退出码为 `0` |
-| `FAILED` | 任务退出码非 `0` |
-| `LOST` | 进程已不在，但没有可靠退出码，通常需要先查日志 |
-| `MISSING` | job 目录不存在，通常是 `job-root` 或 `job-id` 不正确 |
+| State | Meaning |
+|-------|---------|
+| `RUNNING` | The process group still contains running processes, even if the main process has written an exit code |
+| `SUCCEEDED` | The job exit code is `0` |
+| `FAILED` | The job exit code is nonzero |
+| `LOST` | The process is gone but no reliable exit code exists; inspect logs first |
+| `MISSING` | The job directory does not exist, usually because `job-root` or `job-id` is incorrect |
 
-任务重名时，`launch` 默认拒绝覆盖已有 job 目录。只有明确需要复用时才添加 `--reuse`。
+By default, `launch` refuses to overwrite an existing job directory. Add `--reuse` only when reuse is explicitly intended.
 
-如果 pane 本身已经在容器里（例如常驻一个 `docker exec -it <ctr> bash`），直接在这个 pane 上调用 `remote_job.py`，**不要**加 `--container`，也不要为此退出容器：任务会作为普通 shell 任务在容器内运行，`status`、`stop`、`collect` 用法不变。此模式要求容器内有 bash、Python 3.8+ 和 procps 提供的 `ps`（不支持 BusyBox 的 `ps`）；缺少时 `launch` 直接失败且不会启动任务。容器可能被删除重建时，`--job-root` 应放在挂载的持久目录上。
+If the pane is already inside a container, such as a persistent `docker exec -it <ctr> bash`, call `remote_job.py` directly **without** `--container` and keep the shell inside the container. The job runs as an ordinary shell job there; `status`, `stop`, and `collect` work as usual. This mode requires bash, Python 3.8+, and procps `ps` inside the container; BusyBox `ps` is unsupported. If a dependency is missing, `launch` fails without starting the job. When the container may be deleted and recreated, place `--job-root` on a persistent mounted directory.
 
-`--container` 只用于 pane 在宿主机、需要在容器里启动和停止任务的场景。此时容器任务从宿主机 shell 启动；`--container` 会通过容器运行时的 `exec` 真正进入指定容器执行命令。`--cwd` 是容器内目录，`--job-root` 是宿主机上的状态目录：
+Use `--container` only when the pane is on the host and jobs need to start or stop inside a container. Launch from the host shell; the script executes the command through the container runtime's `exec`. `--cwd` is a container directory, while `--job-root` is a host state directory:
 
 ```bash
 python3 scripts/remote_job.py launch \
@@ -312,22 +317,22 @@ python3 scripts/remote_job.py launch \
   --command './train.sh'
 ```
 
-该任务的 `status`、`stop`、`collect` 也从宿主机调用，并使用同一个宿主机状态目录。停止时脚本先按启动时保存的运行时和容器 ID 停容器，再确认进程组内没有仍运行的子进程。默认运行时为 `docker`，在 `launch` 时可用 `--container-runtime` 修改。旧版只有容器名的任务需在宿主机核对后处理。
+Invoke `status`, `stop`, and `collect` from the host with the same host state directory. To stop the job, the script first stops the container using the runtime and container ID saved at launch, then confirms that no child processes remain running in the process group. The default runtime is `docker`; change it at launch with `--container-runtime`. Inspect older jobs that record only a container name from the host before taking action.
 
-## 多会话批量编排
+## Multi-session batch orchestration
 
-`batch_sessions.py` 适合容器重启、批量部署和多机器环境检查等有先后依赖的场景。
+Use `batch_sessions.py` for sequences of dependent actions such as container restarts, batch deployments, and environment checks across machines.
 
-每个步骤声明预期行为：
+Each step declares its expected behavior:
 
-| `expect` | 用途 | 关键字段 |
-|----------|------|----------|
-| `marker` | 普通命令，等待回执并检查退出码 | `command`、可选 `allow_rc` |
-| `disconnect` | 预期 shell 消失，例如退出容器 | 可选 `command` |
-| `ready` | 反复探测直到环境恢复可用 | `command`、`ready_command` |
-| `json` | 执行 Python 体并保留结构化结果 | `python` |
+| `expect` | Purpose | Key fields |
+|----------|---------|------------|
+| `marker` | Ordinary command; wait for a receipt and check its exit code | `command`, optional `allow_rc` |
+| `disconnect` | Expected shell disappearance, such as exiting a container | Optional `command` |
+| `ready` | Probe repeatedly until the environment is available | `command`, `ready_command` |
+| `json` | Execute a Python function body and retain structured results | `python` |
 
-容器重启计划示例：
+Example container restart plan:
 
 ```json
 {
@@ -362,7 +367,7 @@ python3 scripts/remote_job.py launch \
 }
 ```
 
-先干跑，确认步骤和目标会话无误：
+Start with a dry-run to check the steps and target sessions:
 
 ```bash
 python3 scripts/batch_sessions.py \
@@ -371,7 +376,7 @@ python3 scripts/batch_sessions.py \
   --dry-run
 ```
 
-确认后执行：
+Then execute:
 
 ```bash
 python3 scripts/batch_sessions.py \
@@ -379,29 +384,29 @@ python3 scripts/batch_sessions.py \
   --plan restart-plan.json
 ```
 
-默认失败即止，避免在部分机器已经变化、部分机器尚未变化的状态上继续。需要允许健康会话继续时，显式使用 `--continue-on-failure`；失败会话会从后续阶段中剔除。
+By default, the plan stops on failure to avoid advancing with inconsistent machine state. Use `--continue-on-failure` explicitly when healthy sessions should continue; failed sessions are excluded from later stages.
 
-## 文件传输协议
+## File transfer protocol
 
-传输只经过 tmux 会话中已经鉴权的 shell，因此不依赖 `scp`、`rsync` 或再次登录。
+Transfers use only the authenticated shell in the tmux session. They do not rely on `scp`, `rsync`, or another login.
 
-上传时：
+Uploads:
 
-1. 本地将文件按固定大小分块并进行 Base64 编码，按 76 列折行。
-2. 远端先关闭回显并发送 `READY`，本地确认读循环已经就绪后才粘贴数据。
-3. 每块写入远端临时文件，解码完成后返回分块回执。
-4. 全部数据传完后，远端校验 SHA256 和字节数。
-5. 校验通过后才将暂存文件原子改名为正式路径。
+1. Split the local file into fixed-size chunks, Base64-encode them, and wrap lines at 76 columns.
+2. Disable remote echo and wait for `READY` before pasting data into the remote read loop.
+3. Write each chunk to a remote staging file and return a receipt after decoding.
+4. Verify SHA256 and byte counts remotely after all data arrives.
+5. Rename the staging file atomically to the final path only after verification passes.
 
-下载时：
+Downloads:
 
-1. 确认没有已有 `pipe-pane` 日志管道，再取得输出管道并触发远端读取。已有管道时拒绝下载并保留原日志。
-2. 远端按字节范围切片，逐片计算 SHA256 并编码输出。
-3. 本地只接受合法的 Base64 行，并校验每个分片。
-4. 全部分片合并后再次校验整文件 SHA256 和字节数。
-5. 校验通过后才改名到目标路径。
+1. Confirm there is no existing `pipe-pane` logging pipe, acquire an output pipe, then trigger the remote read. If a pipe already exists, refuse the download and preserve the log.
+2. Slice the remote file by byte range, compute each range's SHA256, and encode it for output.
+3. Accept only valid Base64 lines locally and verify every range.
+4. Verify the whole-file SHA256 and byte count after merging all ranges.
+5. Rename to the destination path only after verification passes.
 
-默认分块大小为 `3 MiB`。可根据链路质量调整：
+The default chunk size is `3 MiB`. Adjust it for the link:
 
 ```bash
 python3 scripts/transfer.py put \
@@ -413,132 +418,135 @@ python3 scripts/transfer.py put \
   --chunk-bytes $((1024 * 1024))
 ```
 
-Base64 会带来约 33% 的体积膨胀，PTY 逐行处理也会限制吞吐。因此：
+Base64 adds about 33% overhead, and PTY line-by-line processing limits throughput. Accordingly:
 
-- 目录和大量小文件先打包成单个归档。
-- 源码、日志和 JSON 通常使用 `--compress`。
-- 已压缩归档、图片和模型权重不要重复压缩。
-- 调参时参考返回结果中的 `throughput_mib_s` 和 `elapsed_seconds`。
-- 同一会话内不要并行驱动多个操作。
+- Package directories and many small files into one archive.
+- Use `--compress` for source code, logs, and JSON.
+- Do not recompress compressed archives, images, or model weights.
+- Tune using the reported `throughput_mib_s` and `elapsed_seconds`.
+- Do not drive multiple operations concurrently within the same session.
 
-更完整的时序、参数和失败语义见 [`references/transfer-protocol.md`](./references/transfer-protocol.md)。
+See [`references/transfer-protocol.md`](./references/transfer-protocol.md) for the full sequence, parameters, and failure semantics.
 
-## 超时与失败处理
+## Timeouts and failures
 
-### `TIMEOUT` 不代表命令失败
+### `TIMEOUT` does not mean the command failed
 
-超时只表示在限定时间内没有看到回执。命令可能仍然在远端运行。正确做法是：
+A timeout means no receipt appeared within the time limit. The command may still be running remotely:
 
-1. 使用 `tmux -S SOCK capture-pane -p -t SESSION` 只读查看 pane，确认 shell 已空闲；必要时有针对性地退出传输读循环或交互程序。
-2. 超时或驱动被终止后，未完成标记会阻止后续写入。确认现场后，用 `tmux_exec.py --socket SOCK --sessions SESSION --recover-session --command 'stty echo; pwd' --show-output` 显式恢复。
-3. 恢复后用 `tmux_exec.py` 检查进程、文件或日志，或用 `remote_job.py status` 查看任务状态，再决定是否重试。
+1. Inspect the pane read-only with `tmux -S SOCK capture-pane -p -t SESSION` and confirm the shell is idle. Exit the specific transfer read loop or interactive program if necessary.
+2. After a timeout or terminated driver, an unfinished-operation marker blocks further writes. Once the pane has been inspected, explicitly recover with `tmux_exec.py --socket SOCK --sessions SESSION --recover-session --command 'stty echo; pwd' --show-output`.
+3. After recovery, inspect processes, files, or logs with `tmux_exec.py`, or check job state with `remote_job.py status`, before deciding whether to retry.
 
-不要在没有检查远端状态时直接重发，尤其是训练、部署和数据库变更类命令。
+Never resend without checking remote state, especially for training, deployment, or database changes.
 
-### 常见问题
+### Common issues
 
-| 现象 | 可能原因 | 首要处理 |
-|------|----------|----------|
-| `session not found on socket` | socket 或会话名错误 | 执行 `tmux -S SOCK list-sessions` 核对实际名称 |
-| `session has no panes` | 会话残留但 pane 已销毁 | 在目标会话中人工重建 shell |
-| `remote reader not ready` | shell 已退出或卡在交互程序 | 退出分页器、编辑器或密码提示后再试 |
-| 下载没有合法 marker | pane 有持续后台输出干扰 | 先让 pane 安静，再重试下载 |
-| `wire mismatch` | 传输中的字节或链路损坏 | 临时文件会清理，确认链路后重新传输 |
-| `payload mismatch` | 解压后内容校验失败 | 正式路径未被触碰，检查源文件后重新传输 |
-| `LOST` | 进程被外部终止或机器重启 | 先查看完整日志，不要直接重跑 |
-| 锁等待超时 | 同一会话已有其他驱动占用 | 查清占用者，不要绕过锁 |
+| Symptom | Likely cause | First action |
+|---------|--------------|--------------|
+| `session not found on socket` | Wrong socket or session name | Check names with `tmux -S SOCK list-sessions` |
+| `session has no panes` | The session remains but its panes are gone | Manually recreate a shell in the target session |
+| `remote reader not ready` | The shell exited or is stuck in an interactive program | Exit the pager, editor, or password prompt before retrying |
+| No valid download marker | Continuous background output interferes with the pane | Quiet the pane before retrying |
+| `wire mismatch` | Corrupted transfer bytes or link | Staging is cleaned up; check the link and retransmit |
+| `payload mismatch` | Decompressed content failed verification | The final path is untouched; check the source and retransmit |
+| `LOST` | The process was killed externally or the machine restarted | Inspect full logs before rerunning |
+| Lock wait timeout | Another driver is using the same session | Identify the owner; do not bypass the lock |
 
-故障排查顺序和更多案例见 [`references/troubleshooting.md`](./references/troubleshooting.md)。
+See [`references/troubleshooting.md`](./references/troubleshooting.md) for the investigation sequence and more examples.
 
-## 目录结构
+## Repository layout
 
 ```text
 tmux-ssh-skill/
-├── SKILL.md                         # Skill 主文件：触发规则、原则和标准工作流
-├── README.md                        # 项目说明和使用手册
+├── SKILL.md                         # Skill entrypoint: triggers, rules, and workflow
+├── README.md                        # English project overview and usage guide
+├── README.zh-CN.md                  # Chinese project overview and usage guide
 ├── references/
-│   ├── plan-examples.md             # 批量编排计划、容器重启和部署示例
-│   ├── transfer-protocol.md         # Base64 分块传输协议与性能说明
-│   └── troubleshooting.md           # 会话、执行、传输和任务故障排查
+│   ├── plan-examples.md             # Batch plans, container restarts, and deployment
+│   ├── transfer-protocol.md         # Base64 chunked protocol and performance
+│   └── troubleshooting.md           # Session, execution, transfer, and job failures
 ├── scripts/
-│   ├── batch_sessions.py            # 多会话阶段编排器
-│   ├── remote_job.py                # 远程长期任务管理器
-│   ├── session_preflight.py         # 会话预检器
-│   ├── tmux_exec.py                 # 远程命令和 Python 结构化执行器
-│   ├── tmuxlib.py                   # tmux、回执、锁和远程执行基础库
-│   └── transfer.py                  # 基于 tmux PTY 的文件传输器
+│   ├── batch_sessions.py            # Multi-session stage orchestrator
+│   ├── remote_job.py                # Long-running remote job manager
+│   ├── session_preflight.py         # Session preflight checks
+│   ├── tmux_exec.py                 # Remote commands and structured Python execution
+│   ├── tmuxlib.py                   # Shared tmux, receipt, lock, and execution helpers
+│   └── transfer.py                  # File transfer over tmux PTYs
 └── tests/
-    └── test_workflow.py             # 基于一次性 tmux server 的端到端回归测试
+    └── test_workflow.py             # End-to-end regression checks with disposable tmux servers
 ```
 
-## 常用场景
+## Common workflows
 
-### 远程代码运行
+### Running remote code
 
 ```text
-1. preflight 检查 cwd 和 python3
-2. transfer put 上传归档
-3. tmux_exec 解包并检查依赖
-4. remote_job launch 启动任务
-5. remote_job status 轮询状态
-6. remote_job collect 和 transfer get 收集结果
+1. Check the working directory and python3 with preflight
+2. Upload an archive with transfer put
+3. Unpack and check dependencies with tmux_exec
+4. Launch the job with remote_job launch
+5. Poll with remote_job status
+6. Collect results with remote_job collect and transfer get
 ```
 
-### 容器重启后接管
+### Resuming after a container restart
 
 ```text
-1. batch_sessions 以 disconnect 退出容器
-2. 在宿主机执行容器重启
-3. 以 ready 轮询容器重新进入后的可用状态
-4. 重新发现 pane 并执行环境检查
+1. Exit the container with a batch_sessions disconnect step
+2. Restart the container on the host
+3. Use ready to probe availability after reentry
+4. Rediscover the pane and check the environment
 ```
 
-### 多机器一致性检查
+### Checking consistency across machines
 
 ```text
-1. 使用 sessions 指定多个目标
-2. 使用 tmux_exec 执行同一条检查命令
-3. 使用 --show-output 获取每台机器的输出尾部
-4. 根据 JSON 中的 problem_sessions 定位异常会话
+1. Select targets with sessions
+2. Run the same check with tmux_exec
+3. Retrieve each machine's output tail with --show-output
+4. Identify failing sessions from problem_sessions in the JSON result
 ```
 
-## 参考文档
+## Reference documentation
 
-- [`SKILL.md`](./SKILL.md)：触发条件、核心规则和标准工作流。
-- [`references/plan-examples.md`](./references/plan-examples.md)：批量计划结构、容器重启和部署示例。
-- [`references/transfer-protocol.md`](./references/transfer-protocol.md)：传输时序、性能参数和失败语义。
-- [`references/troubleshooting.md`](./references/troubleshooting.md)：常见故障和排查顺序。
+- [`SKILL.md`](./SKILL.md): invocation scope, core rules, and standard workflow.
+- [`references/plan-examples.md`](./references/plan-examples.md): batch plan structure, container restarts, and deployment examples.
+- [`references/transfer-protocol.md`](./references/transfer-protocol.md): transfer sequence, performance parameters, and failure semantics.
+- [`references/troubleshooting.md`](./references/troubleshooting.md): common failures and investigation order.
 
-## 开发与验证
+The skill entrypoint and references are maintained in English. Project documentation and usage examples are available in English and Chinese.
 
-修改脚本或文档后，可以先执行 Python 语法检查：
+## Development and validation
+
+Check Python syntax after changing scripts or documentation:
 
 ```bash
 python3 -m py_compile scripts/*.py
 ```
 
-### 测试
+### Tests
 
-回归测试只用标准库 `unittest`，在 Linux、macOS 或 WSL 中从仓库根目录运行：
+Existing regression tests use only the standard-library `unittest` module. Run from the repository root on Linux, macOS, or WSL:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-每个用例在临时目录的 socket 上启动一次性 tmux server，用 `bash --norc --noprofile` 模拟远端 shell，调用真实脚本并断言 JSON 输出，结束时只关闭该 server 并清理临时文件。本机没有 tmux 时整套测试自动跳过；完整运行约需 1～2 分钟。
+Each case starts a disposable tmux server on a temporary socket, uses `bash --norc --noprofile` to simulate the remote shell, invokes the real scripts, and checks JSON output. It closes only that server and cleans up temporary files afterward. The suite skips automatically when tmux is unavailable; a full run takes about 1–2 minutes.
 
-批量计划修改后，先使用 `--dry-run` 检查步骤，不要直接把包含重启、退出容器或删除文件的计划发送到远端。
+After changing a batch plan, review it with `--dry-run` before sending any steps that restart containers, exit shells, or delete files.
 
-本项目的命令会在远程环境中真实执行。使用前请确认 socket、会话名、远程 cwd、容器名和目标路径均正确；尤其要审查包含 `rm`、重启、停止服务或覆盖文件的命令。
+Commands execute in the actual remote environment. Check the socket, session names, remote working directory, container names, and paths before use. Review commands involving `rm`, restarts, service stops, or overwrites carefully.
 
-## 贡献
+## Contributing
 
-欢迎通过 Issue 或 Pull Request 改进文档、传输稳定性、任务状态处理和批量编排能力。
+Issues and pull requests are welcome for documentation, transfer reliability, job state handling, and batch orchestration.
 
-提交改动时建议同步检查：
+When submitting changes, check that:
 
-- `SKILL.md` 中的行为描述是否与脚本实现一致。
-- README 中的命令参数是否仍然有效。
-- 新增脚本是否只依赖 Python 标准库，或明确补充依赖说明。
-- 传输协议和故障语义变化时，是否同步更新 `references/transfer-protocol.md` 与 `references/troubleshooting.md`。
-- 执行 `python3 -m py_compile scripts/*.py`，并对远程破坏性计划先执行 `--dry-run`。
+- Behavior described in `SKILL.md` matches the scripts.
+- Both README versions stay in sync and their command arguments remain valid.
+- New scripts use only the Python standard library, or any additional dependencies are documented.
+- Protocol or failure-semantics changes are reflected in `references/transfer-protocol.md` and `references/troubleshooting.md`.
+- `python3 -m py_compile scripts/*.py` passes, and destructive remote plans are reviewed with `--dry-run` first.

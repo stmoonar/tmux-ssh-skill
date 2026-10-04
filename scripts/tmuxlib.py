@@ -42,8 +42,7 @@ if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(json.dumps({
         "status": "FAIL",
-        "error": "native Windows is not supported; run inside WSL "
-                 "(Windows 下请在 WSL 中运行)",
+        "error": "native Windows is not supported; run inside WSL",
         "hint": f'wsl -d <distribution> -e python3 "{_script}" ...',
     }, indent=2))
     sys.exit(2)
