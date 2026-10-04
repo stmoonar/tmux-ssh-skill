@@ -40,6 +40,7 @@ description: 通过本机指定的 tmux socket 和一个或多个 tmux 会话名
 按顺序执行，除有明确理由外不要跳步。
 
 1. 用 `session_preflight.py` 确认会话可用、远端 shell 位置正确、所需命令存在。
+   会话本应在容器内（如常驻 `docker exec -it <ctr> bash`）时加 `--expect-in-container`，容器重启后 pane 掉回宿主机 shell 会被拦下。
 2. 用 `transfer.py put` 送入代码或输入数据。
 3. 用 `tmux_exec.py` 做解包、依赖检查等准备动作。
 4. 用 `remote_job.py launch` 启动长期任务，拿到 `pid` 与 `pgid`。

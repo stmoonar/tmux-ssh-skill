@@ -55,6 +55,8 @@ MARKER_PREFIX = "TSW"
 MAX_INPUT_LINE = 3500
 CHUNK_CHARS = 1800
 CAPTURE_LINES = 2000
+# Files that docker and podman create inside every container.
+CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
 DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 IN_WSL = "microsoft" in platform.uname().release.lower() or "WSL_DISTRO_NAME" in os.environ
 
@@ -341,17 +343,31 @@ def run_shell(
     """Run a shell command in the pane and read back its exit status.
 
     The remote side prints `<marker> rc=<code>` so the result never depends on
-    parsing a human prompt.
+    parsing a human prompt. The command travels base64 encoded and runs via
+    `eval` in the current shell: `cd` and exports persist, while a trailing
+    `&`, a `#` comment, newlines or quotes cannot break the receipt wrapper.
     """
     marker = new_marker("RC")
-    if capture_output:
-        out_path = f"/tmp/tsw-out-{uuid.uuid4().hex}"
-        wrapped = (
-            f"{{ {command} ; }} > {out_path} 2>&1; __tsw_rc=$?; "
-            f"printf '\\n{marker} rc=%s out=%s\\n' \"$__tsw_rc\" {out_path}"
-        )
-    else:
-        wrapped = f"{{ {command} ; }}; __tsw_rc=$?; printf '\\n{marker} rc=%s\\n' \"$__tsw_rc\""
+    out_path = f"/tmp/tsw-out-{uuid.uuid4().hex}"
+
+    def wrap(decode: str) -> str:
+        if capture_output:
+            return (
+                f"eval \"$({decode})\" > {out_path} 2>&1; __tsw_rc=$?; "
+                f"printf '\\n{marker} rc=%s out=%s\\n' \"$__tsw_rc\" {out_path}"
+            )
+        return f"eval \"$({decode})\"; __tsw_rc=$?; printf '\\n{marker} rc=%s\\n' \"$__tsw_rc\""
+
+    # The base64 alphabet needs no shell quoting.
+    encoded = base64.b64encode(command.encode()).decode()
+    wrapped = wrap(f"printf %s {encoded} | base64 -d")
+    if len(wrapped) > MAX_INPUT_LINE:
+        # Stage long commands in bounded lines, like run_python does.
+        scratch = f"/tmp/tsw-cmd-{uuid.uuid4().hex}"
+        tmux.send_line(pane, f": > {scratch}")
+        for offset in range(0, len(encoded), CHUNK_CHARS):
+            tmux.send_line(pane, f"printf %s {encoded[offset:offset + CHUNK_CHARS]} >> {scratch}")
+        wrapped = wrap(f"base64 -d < {scratch}; rm -f {scratch}")
     tmux.send_line(pane, wrapped)
     row = wait_for_marker(tmux, pane, marker, timeout)
     fields = dict(
@@ -423,7 +439,8 @@ def run_python(
     return payload.get("result")
 
 
-def probe_session(tmux: Tmux, session: str, timeout: float = 30.0) -> dict:
+def probe_session(tmux: Tmux, session: str, timeout: float = 30.0,
+                  container_markers: tuple[str, ...] = CONTAINER_MARKERS) -> dict:
     """Report where a session's active pane currently sits."""
     pane = tmux.active_pane(session)
     info = tmux.pane_info(pane)
@@ -435,8 +452,16 @@ def probe_session(tmux: Tmux, session: str, timeout: float = 30.0) -> dict:
         "    user=getpass.getuser()\n"
         "except Exception:\n"
         "    user='unknown'\n"
+        # PID 1's cgroup names the runtime under cgroup v1; v2 hides it,
+        # which is why the marker files come first.
+        f"hints=[p for p in {list(container_markers)!r} if os.path.exists(p)]\n"
+        "try:\n"
+        "    cgroup=open('/proc/1/cgroup').read()\n"
+        "except OSError:\n"
+        "    cgroup=''\n"
+        "hints+=['cgroup:'+w for w in ('docker','kubepods','containerd','libpod','lxc') if w in cgroup]\n"
         "return {'host':socket.gethostname(),'user':user,\n"
-        "    'cwd':os.getcwd(),'shell_pid':os.getppid()}",
+        "    'cwd':os.getcwd(),'shell_pid':os.getppid(),'container_hints':hints}",
         timeout=timeout,
     )
     return {
@@ -448,6 +473,8 @@ def probe_session(tmux: Tmux, session: str, timeout: float = 30.0) -> dict:
         "user": facts.get("user"),
         "cwd": facts.get("cwd"),
         "shell_pid": facts.get("shell_pid"),
+        "in_container": bool(facts.get("container_hints")),
+        "container_hints": facts.get("container_hints", []),
     }
 
 

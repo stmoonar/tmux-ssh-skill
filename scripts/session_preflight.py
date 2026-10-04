@@ -6,6 +6,7 @@ Usage:
                        [--expect-host-contains TEXT]
                        [--expect-cwd-prefix PATH]
                        [--require-command CMD]
+                       [--expect-in-container | --expect-host]
 
 Reports one row per session with the active pane, remote host, user and cwd.
 Exit code 0 only when every session passes.
@@ -17,6 +18,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from tmuxlib import (
+    CONTAINER_MARKERS,
     Tmux,
     TmuxError,
     emit,
@@ -32,7 +34,8 @@ def check_one(args: argparse.Namespace, session: str) -> dict:
     row: dict = {"session": session, "status": "FAIL"}
     try:
         with session_lock(args.socket, session, timeout=args.lock_timeout):
-            info = probe_session(tmux, session, timeout=args.timeout)
+            info = probe_session(tmux, session, timeout=args.timeout,
+                                 container_markers=CONTAINER_MARKERS + tuple(args.container_marker))
             row.update(info)
             problems = []
             if args.expect_host_contains and args.expect_host_contains not in (info["host"] or ""):
@@ -43,6 +46,12 @@ def check_one(args: argparse.Namespace, session: str) -> dict:
                 problems.append(
                     f"cwd {info['cwd']!r} is not under {args.expect_cwd_prefix!r}"
                 )
+            # A restarted container drops a `docker exec` pane back to the
+            # host shell, where later commands would silently land.
+            if args.expect_in_container and not info["in_container"]:
+                problems.append(f"shell is not inside a container (host {info['host']!r})")
+            if args.expect_host and info["in_container"]:
+                problems.append(f"shell is inside a container: {', '.join(info['container_hints'])}")
             for command in args.require_command:
                 probe = run_shell(
                     tmux,
@@ -70,6 +79,13 @@ def main() -> int:
     parser.add_argument("--expect-host-contains")
     parser.add_argument("--expect-cwd-prefix", type=posix_arg)
     parser.add_argument("--require-command", action="append", default=[])
+    where = parser.add_mutually_exclusive_group()
+    where.add_argument("--expect-in-container", action="store_true",
+                       help="fail unless the shell runs inside a container")
+    where.add_argument("--expect-host", action="store_true",
+                       help="fail if the shell runs inside a container")
+    parser.add_argument("--container-marker", action="append", default=[], type=posix_arg,
+                        help="extra remote file whose presence marks a container")
     parser.add_argument("--max-parallel", type=int, default=8)
     args = parser.parse_args()
 

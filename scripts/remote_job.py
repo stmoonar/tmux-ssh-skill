@@ -56,8 +56,23 @@ GROUP_HELPERS = (
     "    if pgid<=1 or pgid==os.getpgrp():\n"
     "        raise SystemError('invalid or controlling-shell process group')\n"
     "    leader=next((p for p in members if p['pid']==int(meta.get('pid') or 0)),None)\n"
-    "    if leader and meta.get('pid_started') and leader['started']!=meta['pid_started']:\n"
-    "        raise SystemError('job PID was reused; refusing to signal an unrelated process group')\n"
+    # A group that outlived its leader keeps its id reserved, so only a live
+    # leader can be a reused PID.
+    "    if not leader:\n"
+    "        return\n"
+    "    started=' '.join(leader['started'].split())\n"
+    "    if meta.get('pid_started'):\n"
+    "        if started!=' '.join(meta['pid_started'].split()):\n"
+    "            raise SystemError('job PID was reused; refusing to signal an unrelated process group')\n"
+    "        return\n"
+    # No stamp recorded: accept only a leader started when the job was.
+    "    try:\n"
+    "        drift=abs(time.mktime(time.strptime(started,'%a %b %d %H:%M:%S %Y'))-float(meta['started_at']))\n"
+    "    except (KeyError,TypeError,ValueError,OverflowError):\n"
+    "        drift=None\n"
+    "    if drift is None or drift>30:\n"
+    "        raise SystemError('job PID may be reused and no start stamp was recorded; '\n"
+    "            'refusing to signal it -- check the process manually')\n"
 )
 RC_SUFFIX = ' 2>&1; __tsw_rc=$?; printf "%s\\n" "$__tsw_rc" > '
 
@@ -85,6 +100,14 @@ def launch(args: argparse.Namespace, session: str) -> dict:
                 "if missing:\n"
                 "    raise SystemError('remote lacks required commands: '+', '.join(missing)+\n"
                 "        '; nothing was started (ps comes from procps)')\n"
+                # Run the exact ps call status/stop rely on; BusyBox ps rejects it.
+                "try:\n"
+                "    usable=any(p['pid']==os.getpid() for p in group_members(os.getpgrp()))\n"
+                "except Exception:\n"
+                "    usable=False\n"
+                "if not usable:\n"
+                "    raise SystemError('ps does not support -axo pid=,pgid=,stat=,lstart= (BusyBox ps?); '\n"
+                "        'nothing was started, install procps')\n"
                 f"job=Path({job_dir!r}).resolve()\n"
                 f"if job.exists() and not {args.reuse!r}:\n"
                 "    raise SystemError('job directory already exists: '+str(job))\n"
@@ -132,9 +155,11 @@ def launch(args: argparse.Namespace, session: str) -> dict:
                 "'controller':'host' if container else 'shell','started_at':time.time()}\n"
                 # The job already runs: persist its handles even if a probe
                 # fails, so status and stop can still reach it.
+                # proc is never waited on, so even an instantly exiting child
+                # stays visible to ps as a zombie until this helper exits.
                 "try:\n"
-                "    meta['pid_started']=subprocess.run(['ps','-p',str(proc.pid),'-o','lstart='],\n"
-                "        text=True,capture_output=True,env={**os.environ,'LC_ALL':'C'}).stdout.strip()\n"
+                "    meta['pid_started']=' '.join(subprocess.run(['ps','-p',str(proc.pid),'-o','lstart='],\n"
+                "        text=True,capture_output=True,env={**os.environ,'LC_ALL':'C'}).stdout.split())\n"
                 "    try:\n"
                 "        meta['pgid']=os.getpgid(proc.pid)\n"
                 "    except Exception:\n"
@@ -167,7 +192,7 @@ def status(args: argparse.Namespace, session: str) -> dict:
             result = run_python(
                 tmux,
                 pane,
-                "import json,os,subprocess\n"
+                "import json,os,subprocess,time\n"
                 "from pathlib import Path\n" + GROUP_HELPERS +
                 f"job=Path({job_dir!r})\n"
                 "if not job.exists():\n"
@@ -240,7 +265,10 @@ def stop(args: argparse.Namespace, session: str) -> dict:
                 "            (done.stderr or '').strip()[:200]))\n"
                 "        inspected=subprocess.run([runtime,'inspect','--format','{{.State.Running}}',target],\n"
                 "            text=True,capture_output=True,timeout=15)\n"
-                "        container_stopped=done.returncode==0 and inspected.returncode==0 and inspected.stdout.strip()=='false'\n"
+                # A `--rm` container is gone once stopped; inspect then fails.
+                "        removed=inspected.returncode!=0 and 'no such' in (inspected.stderr or '').lower()\n"
+                "        container_stopped=done.returncode==0 and (removed or (inspected.returncode==0\n"
+                "            and inspected.stdout.strip()=='false'))\n"
                 "    except (OSError,subprocess.TimeoutExpired) as err:\n"
                 "        notes.append('container stop failed: %s'%err)\n"
                 "pgid=meta.get('pgid')\n"

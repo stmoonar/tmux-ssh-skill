@@ -159,7 +159,7 @@ python3 scripts/session_preflight.py \
   --require-command python3
 ```
 
-可以额外使用 `--expect-host-contains` 检查远端主机标识。预检只有在所有会话都通过时才返回成功。
+可以额外使用 `--expect-host-contains` 检查远端主机标识。会话本应停在容器内（例如常驻 `docker exec -it <ctr> bash`）时加 `--expect-in-container`：容器重启后 pane 会掉回宿主机 shell，预检据此失败，避免后续命令落到宿主机上；反之用 `--expect-host` 确认不在容器里。检测依据是 `/.dockerenv`、`/run/.containerenv` 或 PID 1 的 cgroup，其他运行时可用 `--container-marker PATH` 补充标记文件。结果中的 `in_container` 和 `container_hints` 给出判断依据。预检只有在所有会话都通过时才返回成功。
 
 ### 2. 执行远程命令
 

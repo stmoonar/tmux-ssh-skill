@@ -91,6 +91,15 @@ class TmuxCase(unittest.TestCase):
     def assert_pass(self, rc: int, data: dict) -> None:
         self.assertEqual((rc, data.get("status")), (0, "PASS"), json.dumps(data, ensure_ascii=False, indent=2))
 
+    def shim_session(self, name: str, **shims: str) -> None:
+        """Start a session whose PATH puts fake commands (sh scripts) first."""
+        shimdir = self.tmp / f"shim-{name}"
+        shimdir.mkdir()
+        for tool, body in shims.items():
+            (shimdir / tool).write_text("#!/bin/sh\n" + body, encoding="utf-8")
+            (shimdir / tool).chmod(0o755)
+        self.start_session(name, f"env PATH={shlex.quote(str(shimdir))}:\"$PATH\" {SHELL}")
+
     def run_plan(self, steps: list[dict], sessions: str = "remote") -> tuple[int, dict]:
         plan = self.tmp / "plan.json"
         plan.write_text(json.dumps({"sessions": sessions.split(","), "steps": steps}), encoding="utf-8")
@@ -109,6 +118,77 @@ class ExecTests(TmuxCase):
                                    "--command", "printf '你好，世界\\n第二行\\n'", "--show-output")
         self.assert_pass(rc, data)
         self.assertEqual(data["results"][0]["output"], ["你好，世界", "第二行"])
+
+    def test_preflight_expect_host(self) -> None:
+        if any(os.path.exists(p) for p in ("/.dockerenv", "/run/.containerenv")):
+            self.skipTest("the test machine itself is a container")
+        rc, data = self.run_script("session_preflight.py", "--sessions", "remote", "--expect-host")
+        self.assert_pass(rc, data)
+        self.assertFalse(data["results"][0]["in_container"])
+        rc, data = self.run_script("session_preflight.py", "--sessions", "remote", "--expect-in-container")
+        self.assertEqual((rc, data["status"]), (1, "FAIL"))
+        self.assertIn("not inside a container", data["results"][0]["problems"][0])
+
+    def test_preflight_expect_in_container(self) -> None:
+        # A test-controlled marker stands in for /.dockerenv.
+        marker = self.tmp / "dockerenv"
+        marker.touch()
+        args = ("--sessions", "remote", "--container-marker", str(marker))
+        rc, data = self.run_script("session_preflight.py", *args, "--expect-in-container")
+        self.assert_pass(rc, data)
+        self.assertTrue(data["results"][0]["in_container"])
+        self.assertIn(str(marker), data["results"][0]["container_hints"])
+        rc, data = self.run_script("session_preflight.py", *args, "--expect-host")
+        self.assertEqual((rc, data["status"]), (1, "FAIL"))
+        self.assertIn("inside a container", data["results"][0]["problems"][0])
+
+
+class ShellTests(TmuxCase):
+    """run_shell must survive any command text, in the current shell."""
+
+    def exec(self, command: str, *extra: str) -> tuple[int, dict]:
+        return self.run_script("tmux_exec.py", "--sessions", "remote", "--command", command,
+                               "--timeout", "15", *extra)
+
+    def output(self, command: str) -> list[str]:
+        rc, data = self.exec(command, "--show-output")
+        self.assert_pass(rc, data)
+        return data["results"][0]["output"]
+
+    def test_trailing_ampersand(self) -> None:
+        flag = self.tmp / "bg done"
+        rc, data = self.exec(f"sleep 0.2 && touch {shlex.quote(str(flag))} &")
+        self.assert_pass(rc, data)
+        self.assertTrue(wait_until(flag.exists))
+
+    def test_inline_comment(self) -> None:
+        self.assertEqual(self.output("echo hi # trailing comment ; }"), ["hi"])
+
+    def test_multi_line(self) -> None:
+        command = "for x in a b; do\n  echo \"item $x\"\ndone\ncat <<'EOF'\nheredoc $x\nEOF"
+        self.assertEqual(self.output(command), ["item a", "item b", "heredoc $x"])
+
+    def test_quote_heavy(self) -> None:
+        command = """printf '%s|' "it's" 'say "hi"' '$HOME' "tab\\there" '`x`' "{ ; }"; echo"""
+        self.assertEqual(self.output(command), ["it's|say \"hi\"|$HOME|tab\\there|`x`|{ ; }|"])
+
+    def test_cd_and_export_persist(self) -> None:
+        where = self.tmp / "cd dir"
+        where.mkdir()
+        rc, data = self.exec(f"cd {shlex.quote(str(where))} && export TSW_PERSIST=kept")
+        self.assert_pass(rc, data)
+        self.assertEqual(self.output('pwd; echo "$TSW_PERSIST"'), [str(where), "kept"])
+
+    def test_over_long_command(self) -> None:
+        # Far beyond one canonical PTY line (~4 KiB); must be staged, not cut.
+        # Without readline the tty line discipline truncates, as for sh/dash.
+        self.start_session("canon", f"{SHELL} --noediting")
+        text = "x" * 12000
+        command = f"printf %s '{text}' | wc -c | tr -d ' '"
+        rc, data = self.run_script("tmux_exec.py", "--sessions", "canon", "--command", command,
+                                   "--timeout", "15", "--show-output")
+        self.assert_pass(rc, data)
+        self.assertEqual(data["results"][0]["output"], ["12000"])
 
 
 class TransferTests(TmuxCase):
@@ -175,8 +255,9 @@ class TransferTests(TmuxCase):
 
 
 class JobTests(TmuxCase):
-    def job(self, mode: str, job_id: str, root: Path, *extra: str) -> tuple[int, dict]:
-        return self.run_script("remote_job.py", mode, "--sessions", "remote", "--job-id", job_id,
+    def job(self, mode: str, job_id: str, root: Path, *extra: str,
+            session: str = "remote") -> tuple[int, dict]:
+        return self.run_script("remote_job.py", mode, "--sessions", session, "--job-id", job_id,
                                "--job-root", str(root), *extra)
 
     def test_launch_status_stop_with_spaces(self) -> None:
@@ -249,6 +330,77 @@ class JobTests(TmuxCase):
         time.sleep(1.5)
         self.assertFalse(started.exists(), "the job ran although launch reported FAIL")
         self.assertFalse((root / "slim").exists())
+
+    def test_launch_with_busybox_ps_starts_nothing(self) -> None:
+        # BusyBox ps exists but rejects the BSD selectors that status/stop need.
+        self.shim_session("bb", ps="echo \"ps: invalid option -- 'x'\" >&2\nexit 1\n")
+        root = self.tmp / "jobs"
+        started = self.tmp / "started"
+        rc, data = self.job("launch", "bb", root, "--command",
+                            f"echo yes > {shlex.quote(str(started))}; sleep 30", session="bb")
+        self.assertEqual((rc, data["status"]), (1, "FAIL"))
+        self.assertIn("ps", data["results"][0]["error"])
+        time.sleep(1.5)
+        self.assertFalse(started.exists(), "the job ran although launch reported FAIL")
+        self.assertFalse((root / "bb").exists())
+
+    def test_stop_removed_rm_container(self) -> None:
+        # Fake docker: `stop` removes the container as `run --rm` would, after
+        # which inspect fails with "No such object".
+        gone = shlex.quote(str(self.tmp / "container removed"))
+        self.shim_session("host", docker=(
+            "for target; do :; done\n"
+            "case \"$1\" in\n"
+            f"inspect) if [ -e {gone} ]; then echo \"Error: No such object: $target\" >&2; exit 1; fi\n"
+            "  case \"$3\" in *Id*) echo 'true fake0123';; *) echo true;; esac;;\n"
+            "exec) shift; if [ \"$1\" = -w ]; then cd \"$2\" || exit 1; shift 2; fi; shift; exec \"$@\";;\n"
+            f"stop) : > {gone};;\n"
+            "*) echo \"fake docker: $1 unsupported\" >&2; exit 2;;\n"
+            "esac\n"))
+        root = self.tmp / "jobs"
+        rc, data = self.job("launch", "ctr", root, "--container", "trainer", "--command", "sleep 600",
+                            session="host")
+        self.assert_pass(rc, data)
+        pgid = data["results"][0]["meta"]["pgid"]
+        rc, data = self.job("stop", "ctr", root, "--grace-seconds", "2", session="host")
+        self.assert_pass(rc, data)
+        self.assertTrue(data["results"][0]["result"]["container_stopped"])
+        self.assertFalse(group_alive(pgid))
+
+    def test_instant_exit_job_records_start_stamp(self) -> None:
+        # The unreaped child stays visible as a zombie, so ps still dates it.
+        root = self.tmp / "jobs"
+        rc, data = self.job("launch", "instant", root, "--command", "true")
+        self.assert_pass(rc, data)
+        self.assertRegex(data["results"][0]["meta"]["pid_started"], r"\d\d:\d\d:\d\d \d{4}$")
+
+    def test_missing_stamp_still_stops_own_job(self) -> None:
+        root = self.tmp / "jobs"
+        rc, data = self.job("launch", "legacy", root, "--command", "sleep 600")
+        self.assert_pass(rc, data)
+        meta_file = root / "legacy" / "meta.json"
+        meta = json.loads(meta_file.read_text())
+        meta["pid_started"] = ""
+        meta_file.write_text(json.dumps(meta))
+        rc, data = self.job("stop", "legacy", root, "--grace-seconds", "2")
+        self.assert_pass(rc, data)
+        self.assertFalse(group_alive(meta["pgid"]))
+
+    def test_missing_stamp_refuses_reused_pid(self) -> None:
+        # The recorded PID now leads an unrelated group started long after the
+        # job; without a stamp, stop must refuse rather than kill it.
+        stranger = subprocess.Popen(["sleep", "600"], start_new_session=True)
+        self.addCleanup(stranger.wait)
+        self.addCleanup(stranger.kill)
+        job = self.tmp / "jobs" / "reused"
+        job.mkdir(parents=True)
+        (job / "meta.json").write_text(json.dumps({
+            "job_id": "reused", "pid": stranger.pid, "pgid": stranger.pid, "pid_started": "",
+            "container": "", "started_at": time.time() - 3600}))
+        rc, data = self.job("stop", "reused", job.parent, "--grace-seconds", "1")
+        self.assertEqual((rc, data["status"]), (1, "FAIL"))
+        self.assertIn("PID", data["results"][0]["error"])
+        self.assertIsNone(stranger.poll(), "an unrelated process group was signalled")
 
 
 class BatchTests(TmuxCase):
